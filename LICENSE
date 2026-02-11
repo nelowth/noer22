@@ -1,0 +1,49 @@
+NOER22 PERSONAL USE LICENSE v1.0
+
+Copyright (c) 2026 noer22 author.
+All rights reserved.
+
+1. Definitions
+- "Software" means this project, source code, binaries, assets, documentation, and any derivative work.
+- "Personal Use" means private, non-commercial use by an individual, with no direct or indirect revenue.
+
+2. License Grant (Personal Use Only)
+Permission is granted to use, copy, and modify the Software strictly for Personal Use.
+
+3. Restrictions
+Without prior written authorization from the copyright holder, you may NOT:
+- sell, resell, rent, lease, sublicense, or commercially distribute the Software;
+- publish, distribute, or monetize any fork or derivative work;
+- provide the Software (or any fork/derivative) as a paid or revenue-generating service;
+- include the Software in a commercial product, bundle, or marketplace listing.
+
+4. Forks and Derivatives
+- Private forks for Personal Use are allowed.
+- Public sharing or redistribution of forks/derivatives requires prior written authorization.
+- Any resale or commercial use of any fork is expressly prohibited without authorization.
+
+5. Improvement Requests and Contributions
+If you identify possible improvements (features, performance, security, UX, or bug fixes),
+please contact the author before publishing derivative distributions.
+
+Preferred contact channel:
+- Open an issue in this repository, or contact the author through the repository profile.
+
+6. Attribution and Notices
+If authorized redistribution is granted, this license notice and copyright notice must be kept.
+
+7. No Warranty
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
+AND NON-INFRINGEMENT.
+
+8. Limitation of Liability
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES,
+OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+9. Termination
+Any violation of this license terminates your rights under this license immediately.
+
+10. Reservation of Rights
+All rights not expressly granted are reserved by the copyright holder.

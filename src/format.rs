@@ -3,6 +3,9 @@ use crate::error::{NoerError, Result};
 pub const MAGIC: &[u8; 8] = b"NOER22\0\0";
 pub const VERSION: u16 = 1;
 pub const HEADER_SIZE: usize = 64;
+pub const FLAG_KEYFILE_REQUIRED: u8 = 1 << 0;
+pub const FLAG_INCREMENTAL_ARCHIVE: u8 = 1 << 1;
+pub const FLAG_AGE_RECIPIENTS: u8 = 1 << 2;
 
 #[derive(Debug, Clone, Copy)]
 pub enum CompressionAlgo {
@@ -32,6 +35,13 @@ impl Default for KdfParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeaderFlags {
+    pub keyfile_required: bool,
+    pub incremental: bool,
+    pub age_recipients: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Header {
     pub compression: CompressionAlgo,
@@ -39,6 +49,7 @@ pub struct Header {
     pub salt: [u8; 16],
     pub nonce: [u8; 12],
     pub kdf: KdfParams,
+    pub flags: HeaderFlags,
 }
 
 impl Header {
@@ -48,6 +59,7 @@ impl Header {
         salt: [u8; 16],
         nonce: [u8; 12],
         kdf: KdfParams,
+        flags: HeaderFlags,
     ) -> Self {
         Self {
             compression,
@@ -55,6 +67,7 @@ impl Header {
             salt,
             nonce,
             kdf,
+            flags,
         }
     }
 
@@ -69,6 +82,17 @@ impl Header {
         buf[40..44].copy_from_slice(&self.kdf.mem_kib.to_le_bytes());
         buf[44..48].copy_from_slice(&self.kdf.iterations.to_le_bytes());
         buf[48..52].copy_from_slice(&self.kdf.parallelism.to_le_bytes());
+        let mut flags = 0u8;
+        if self.flags.keyfile_required {
+            flags |= FLAG_KEYFILE_REQUIRED;
+        }
+        if self.flags.incremental {
+            flags |= FLAG_INCREMENTAL_ARCHIVE;
+        }
+        if self.flags.age_recipients {
+            flags |= FLAG_AGE_RECIPIENTS;
+        }
+        buf[52] = flags;
         buf
     }
 
@@ -98,6 +122,7 @@ impl Header {
         let mem_kib = u32::from_le_bytes(bytes[40..44].try_into().unwrap());
         let iterations = u32::from_le_bytes(bytes[44..48].try_into().unwrap());
         let parallelism = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
+        let flags_byte = bytes[52];
         let kdf = if mem_kib == 0 || iterations == 0 || parallelism == 0 {
             KdfParams::default()
         } else {
@@ -107,6 +132,11 @@ impl Header {
                 parallelism,
             }
         };
+        let flags = HeaderFlags {
+            keyfile_required: flags_byte & FLAG_KEYFILE_REQUIRED != 0,
+            incremental: flags_byte & FLAG_INCREMENTAL_ARCHIVE != 0,
+            age_recipients: flags_byte & FLAG_AGE_RECIPIENTS != 0,
+        };
 
         Ok(Header {
             compression,
@@ -114,6 +144,7 @@ impl Header {
             salt,
             nonce,
             kdf,
+            flags,
         })
     }
 }

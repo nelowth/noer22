@@ -1,4 +1,6 @@
-use crate::cli::{ListArgs, UnpackArgs, VerifyArgs};
+use crate::agewrap;
+use crate::checksum::{self, ChecksumAlgo};
+use crate::cli::{ChecksumChoice, ListArgs, UnpackArgs, VerifyArgs};
 use crate::crypto::{self, DecryptReader};
 use crate::error::{NoerError, Result};
 use crate::format::{CryptoAlgo, Header, HEADER_SIZE, VERSION};
@@ -9,6 +11,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
+const MAX_AGE_ENVELOPE_LEN: usize = 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ArchiveOverview {
     pub version: u16,
@@ -16,15 +20,33 @@ pub struct ArchiveOverview {
     pub kdf_mem_mib: u32,
     pub kdf_iters: u32,
     pub kdf_parallelism: u32,
+    pub keyfile_required: bool,
+    pub incremental_archive: bool,
+    pub age_recipients_archive: bool,
     pub total_entries: usize,
     pub file_count: usize,
     pub dir_count: usize,
+    pub deleted_count: usize,
     pub total_bytes: u64,
     pub entries: Vec<FileEntry>,
 }
 
 pub fn unpack(args: UnpackArgs) -> Result<()> {
-    let opened = open_archive(&args.archive, &args.password)?;
+    if let Some(checksum_file) = args.checksum_file.as_ref() {
+        let result = checksum::verify_sidecar(
+            &args.archive,
+            checksum_file,
+            args.checksum_algo.map(checksum_choice_to_algo),
+        )?;
+        println!("External checksum OK ({})", result.algo.id());
+    }
+
+    let opened = open_archive(
+        &args.archive,
+        args.password.as_deref(),
+        args.keyfile.as_deref(),
+        &args.age_identities,
+    )?;
 
     let out_dir = match args.output {
         Some(dir) => dir,
@@ -32,7 +54,13 @@ pub fn unpack(args: UnpackArgs) -> Result<()> {
     };
     std::fs::create_dir_all(&out_dir)?;
 
-    let total_size: u64 = opened.metadata.files.iter().map(|f| f.size).sum();
+    let total_size: u64 = opened
+        .metadata
+        .files
+        .iter()
+        .filter(|f| !f.is_dir && !f.deleted)
+        .map(|f| f.size)
+        .sum();
     let pb = utils::progress_bar(total_size, "extracting");
 
     let decrypt_reader = DecryptReader::new(opened.reader, opened.decryptor);
@@ -43,7 +71,12 @@ pub fn unpack(args: UnpackArgs) -> Result<()> {
     for entry in opened.metadata.files {
         let rel = utils::sanitize_rel_path(&entry.path)?;
         let out_path: PathBuf = out_dir.join(rel);
+        if entry.deleted {
+            remove_existing_path(&out_path)?;
+            continue;
+        }
         if entry.is_dir {
+            ensure_directory_path(&out_path)?;
             std::fs::create_dir_all(&out_path)?;
             #[cfg(unix)]
             {
@@ -55,7 +88,11 @@ pub fn unpack(args: UnpackArgs) -> Result<()> {
         }
 
         if let Some(parent) = out_path.parent() {
+            ensure_directory_path(parent)?;
             std::fs::create_dir_all(parent)?;
+        }
+        if out_path.is_dir() {
+            std::fs::remove_dir_all(&out_path)?;
         }
         let mut out_file = File::create(&out_path)?;
         if let Err(err) = utils::copy_exact(&mut decoder, &mut out_file, entry.size, &pb) {
@@ -80,12 +117,27 @@ pub fn unpack(args: UnpackArgs) -> Result<()> {
 }
 
 pub fn inspect_archive(path: &Path, password: &str) -> Result<ArchiveOverview> {
-    let opened = open_archive(path, password)?;
+    inspect_archive_with_auth(path, Some(password), None, &[])
+}
+
+pub fn inspect_archive_with_auth(
+    path: &Path,
+    password: Option<&str>,
+    keyfile: Option<&Path>,
+    age_identities: &[PathBuf],
+) -> Result<ArchiveOverview> {
+    let opened = open_archive(path, password, keyfile, age_identities)?;
     Ok(build_overview(&opened.header, &opened.metadata))
 }
 
 pub fn list(args: ListArgs) -> Result<()> {
-    let overview = inspect_archive(&args.archive, &args.password)?;
+    let opened = open_archive(
+        &args.archive,
+        args.password.as_deref(),
+        args.keyfile.as_deref(),
+        &args.age_identities,
+    )?;
+    let overview = build_overview(&opened.header, &opened.metadata);
 
     println!("Archive: {}", args.archive.display());
     println!("Version: {}", overview.version);
@@ -94,9 +146,25 @@ pub fn list(args: ListArgs) -> Result<()> {
         "KDF Argon2id: mem={} MiB, iters={}, parallel={}",
         overview.kdf_mem_mib, overview.kdf_iters, overview.kdf_parallelism
     );
+    let auth_mode = if overview.age_recipients_archive {
+        "age recipients"
+    } else if overview.keyfile_required {
+        "password + keyfile / keyfile-only"
+    } else {
+        "password"
+    };
+    println!("Auth material: {auth_mode}");
     println!(
-        "Entries: {} ({} files, {} directories)",
-        overview.total_entries, overview.file_count, overview.dir_count
+        "Archive mode: {}",
+        if overview.incremental_archive {
+            "incremental"
+        } else {
+            "full"
+        }
+    );
+    println!(
+        "Entries: {} ({} files, {} directories, {} deletions)",
+        overview.total_entries, overview.file_count, overview.dir_count, overview.deleted_count
     );
     println!("Payload size: {}", utils::human_bytes(overview.total_bytes));
     println!();
@@ -104,8 +172,14 @@ pub fn list(args: ListArgs) -> Result<()> {
     if args.long {
         println!("TYPE  SIZE         MODIFIED    MODE   PATH");
         for entry in &overview.entries {
-            let kind = if entry.is_dir { "dir " } else { "file" };
-            let size = if entry.is_dir {
+            let kind = if entry.deleted {
+                "del "
+            } else if entry.is_dir {
+                "dir "
+            } else {
+                "file"
+            };
+            let size = if entry.is_dir || entry.deleted {
                 "-".to_string()
             } else {
                 utils::human_bytes(entry.size)
@@ -117,7 +191,9 @@ pub fn list(args: ListArgs) -> Result<()> {
         }
     } else {
         for entry in &overview.entries {
-            if entry.is_dir {
+            if entry.deleted {
+                println!("[DEL]  {}", entry.path);
+            } else if entry.is_dir {
                 println!("[DIR]  {}", entry.path);
             } else {
                 println!("[FILE] {} ({})", entry.path, utils::human_bytes(entry.size));
@@ -129,13 +205,52 @@ pub fn list(args: ListArgs) -> Result<()> {
 }
 
 pub fn verify(args: VerifyArgs) -> Result<()> {
-    let opened = open_archive(&args.archive, &args.password)?;
+    let mut verified_any = false;
+
+    if let Some(checksum_file) = args.checksum_file.as_ref() {
+        let result = checksum::verify_sidecar(
+            &args.archive,
+            checksum_file,
+            args.checksum_algo.map(checksum_choice_to_algo),
+        )?;
+        println!("External checksum OK ({})", result.algo.id());
+        verified_any = true;
+    }
+
+    if args.password.is_some() || args.keyfile.is_some() || !args.age_identities.is_empty() {
+        verify_archive_payload(
+            &args.archive,
+            args.password.as_deref(),
+            args.keyfile.as_deref(),
+            &args.age_identities,
+        )?;
+        println!("Payload verification OK");
+        verified_any = true;
+    }
+
+    if !verified_any {
+        return Err(NoerError::InvalidFormat(
+            "provide auth credentials/age identity or --checksum-file".into(),
+        ));
+    }
+
+    println!("Verification complete: integrity OK");
+    Ok(())
+}
+
+fn verify_archive_payload(
+    path: &Path,
+    password: Option<&str>,
+    keyfile: Option<&Path>,
+    age_identities: &[PathBuf],
+) -> Result<()> {
+    let opened = open_archive(path, password, keyfile, age_identities)?;
 
     let total_size: u64 = opened
         .metadata
         .files
         .iter()
-        .filter(|f| !f.is_dir)
+        .filter(|f| !f.is_dir && !f.deleted)
         .map(|f| f.size)
         .sum();
     let pb = utils::progress_bar(total_size, "verifying");
@@ -147,7 +262,7 @@ pub fn verify(args: VerifyArgs) -> Result<()> {
 
     let mut sink = std::io::sink();
     for entry in opened.metadata.files {
-        if entry.is_dir {
+        if entry.is_dir || entry.deleted {
             continue;
         }
         if let Err(err) = utils::copy_exact(&mut decoder, &mut sink, entry.size, &pb) {
@@ -161,7 +276,6 @@ pub fn verify(args: VerifyArgs) -> Result<()> {
     ensure_decoder_drained(&mut decoder)?;
 
     pb.finish_and_clear();
-    println!("Verification complete: integrity OK");
     Ok(())
 }
 
@@ -172,7 +286,12 @@ struct OpenArchive {
     decryptor: crypto::ChunkDecryptor,
 }
 
-fn open_archive(path: &Path, password: &str) -> Result<OpenArchive> {
+fn open_archive(
+    path: &Path,
+    password: Option<&str>,
+    keyfile_path: Option<&Path>,
+    age_identities: &[PathBuf],
+) -> Result<OpenArchive> {
     let input = File::open(path)?;
     let mut reader = BufReader::new(input);
 
@@ -180,8 +299,27 @@ fn open_archive(path: &Path, password: &str) -> Result<OpenArchive> {
     reader.read_exact(&mut header_bytes)?;
     let header = Header::from_bytes(header_bytes)?;
 
-    let password = Zeroizing::new(password.to_string());
-    let key = crypto::derive_key(password.as_ref(), &header.salt, header.kdf)?;
+    let key = if header.flags.age_recipients {
+        let envelope = read_age_envelope(&mut reader)?;
+        agewrap::decrypt_file_key(&envelope, age_identities)?
+    } else {
+        let keyfile = keyfile_path.map(crypto::read_keyfile).transpose()?;
+        if header.flags.keyfile_required && keyfile.is_none() {
+            return Err(NoerError::InvalidFormat(
+                "archive requires keyfile; provide --keyfile <path>".into(),
+            ));
+        }
+
+        let password = password.map(|p| Zeroizing::new(p.to_string()));
+        let password_ref = password.as_deref().map(|s| s.as_str());
+        crypto::derive_key_material(
+            password_ref,
+            keyfile.as_deref().map(|v| v.as_slice()),
+            &header.salt,
+            header.kdf,
+        )?
+    };
+
     let mut decryptor = crypto::ChunkDecryptor::new(
         header.crypto,
         key.as_ref(),
@@ -203,13 +341,32 @@ fn open_archive(path: &Path, password: &str) -> Result<OpenArchive> {
     })
 }
 
+fn read_age_envelope<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len == 0 || len > MAX_AGE_ENVELOPE_LEN {
+        return Err(NoerError::InvalidFormat(
+            "invalid age envelope length".into(),
+        ));
+    }
+    let mut envelope = vec![0u8; len];
+    reader.read_exact(&mut envelope)?;
+    Ok(envelope)
+}
+
 fn build_overview(header: &Header, metadata: &Metadata) -> ArchiveOverview {
-    let file_count = metadata.files.iter().filter(|f| !f.is_dir).count();
+    let file_count = metadata
+        .files
+        .iter()
+        .filter(|f| !f.is_dir && !f.deleted)
+        .count();
     let dir_count = metadata.files.iter().filter(|f| f.is_dir).count();
+    let deleted_count = metadata.files.iter().filter(|f| f.deleted).count();
     let total_bytes = metadata
         .files
         .iter()
-        .filter(|f| !f.is_dir)
+        .filter(|f| !f.is_dir && !f.deleted)
         .map(|f| f.size)
         .sum();
 
@@ -219,9 +376,13 @@ fn build_overview(header: &Header, metadata: &Metadata) -> ArchiveOverview {
         kdf_mem_mib: header.kdf.mem_kib / 1024,
         kdf_iters: header.kdf.iterations,
         kdf_parallelism: header.kdf.parallelism,
+        keyfile_required: header.flags.keyfile_required,
+        incremental_archive: header.flags.incremental,
+        age_recipients_archive: header.flags.age_recipients,
         total_entries: metadata.files.len(),
         file_count,
         dir_count,
+        deleted_count,
         total_bytes,
         entries: metadata.files.clone(),
     }
@@ -262,4 +423,39 @@ fn crypto_name(crypto: CryptoAlgo) -> &'static str {
         CryptoAlgo::ChaCha20Poly1305 => "ChaCha20-Poly1305",
         CryptoAlgo::Aes256Gcm => "AES-256-GCM",
     }
+}
+
+fn checksum_choice_to_algo(choice: ChecksumChoice) -> ChecksumAlgo {
+    match choice {
+        ChecksumChoice::Sha256 => ChecksumAlgo::Sha256,
+        ChecksumChoice::Blake3 => ChecksumAlgo::Blake3,
+    }
+}
+
+fn remove_existing_path(path: &Path) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(NoerError::Io(err)),
+    };
+
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn ensure_directory_path(path: &Path) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(NoerError::Io(err)),
+    };
+
+    if !meta.is_dir() {
+        remove_existing_path(path)?;
+    }
+    Ok(())
 }

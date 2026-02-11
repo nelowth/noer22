@@ -14,6 +14,8 @@ pub struct FileEntry {
     pub mode: u32,
     #[serde(default)]
     pub is_dir: bool,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 pub fn serialize(metadata: &Metadata) -> Result<Vec<u8>> {

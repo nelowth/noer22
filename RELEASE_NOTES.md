@@ -1,42 +1,64 @@
 # Release Notes (GitHub-ready)
 
-## noer22 v0.2.0
+## noer22 v0.3.0
 
-A major quality and usability release focused on archive reliability, professional UX, and production-ready documentation.
+A feature release focused on practical backup workflows: keyfile auth, age public-key mode, incremental/delta mode, and passwordless checksum verification.
 
 ### Highlights
-- Added `list` and `verify` commands to the CLI.
-- Added `List` and `Verify` modes to the desktop GUI.
-- Improved pack/unpack reliability for tricky path structures.
-- Reduced allocation overhead in the crypto chunk pipeline.
-- Upgraded docs and release assets for GitHub publishing.
+- Added keyfile support (`--keyfile`) for pack/unpack/list/verify.
+- Added hybrid auth (`password + keyfile`) and keyfile-only archives.
+- Added age recipient mode (`--age-recipient`) and identity-based decryption (`--age-identity`).
+- Desktop GUI now supports full auth parity (password/keyfile + age), checksum workflows,
+  incremental index selection, and parallel-crypto toggle.
+- Added `noer22_bench` benchmark binary to compare noer22 against optional `7z` on the same dataset.
+- Updated `pack` default compression level to `8` (from `6`) based on mixed workload benchmark results.
+- Added incremental/delta mode (`--incremental-index`) using BLAKE3 fingerprints.
+- Added incremental tombstones for removed files (applied during unpack).
+- Added external checksum generation (`--checksum sha256|blake3`) and verification.
+- Added checksum-only verification flow (`verify --checksum-file ...`) without password.
+- Added full-screen terminal wizard (`ratatui`) for pack/unpack/list/verify flows.
+- Added `--parallel-crypto` experimental deterministic parallel encryption pipeline.
 
 ### What Changed
 
-#### Core Improvements
-- Fix path mapping/collision handling in pack to preserve root directories and support empty directory inputs.
-- Optimize crypto chunk pipeline to reduce allocations and correct buffered flush semantics.
-- Add new CLI commands list and verify with implementation modules.
-- Harden unpack with metadata path validation and clearer error handling.
+#### Core
+- Extended archive header flags to indicate keyfile-protected, incremental, and age-recipient archives.
+- Updated KDF input model to combine password + keyfile material when both are present.
+- Added age-wrapped file-key envelope for recipient-based archives.
+- Incremental archives now emit deletion tombstones for removed files.
+- Added sidecar checksum module with strict algorithm handling.
+- Added incremental index module (JSON) with parallel file hashing.
 
-#### Tests and Docs
-- Add/update tests and docs, then run full test suite.
-- Updated README with clearer onboarding and GUI mode descriptions.
-- Added changelog and this release-notes draft.
+#### UX
+- `list` now reports auth mode and archive mode (full/incremental).
+- `unpack` can verify checksum sidecar before extraction.
 
-### Validation
+#### Validation
+- Added integration tests for:
+  - keyfile-only roundtrip and missing-keyfile failure,
+  - age recipient roundtrip using generated identity,
+  - checksum-sidecar verification without password,
+  - incremental archive containing only changed files.
+
+### Commands
+```bash
+noer22 pack <input...> -o backup.noer [-p PASS] [--keyfile FILE] \
+  [--age-recipient AGE1...] [--incremental-index index.json] \
+  [--checksum sha256|blake3] [--parallel-crypto]
+
+noer22 unpack backup.noer --age-identity identity.txt -C out
+
+noer22 verify backup.noer --checksum-file backup.noer.sha256
+```
+
+### Validation Executed
 - `cargo fmt`
-- `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test`
+- `cargo test --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
 
 All checks passed.
 
-### GUI Showcase Template
-Add screenshots to:
-- `assets/screenshots/gui-pack.png`
-- `assets/screenshots/gui-extract.png`
-- `assets/screenshots/gui-list.png`
-- `assets/screenshots/gui-verify.png`
-
-### Notes on License
-This release uses a custom personal-use-only license. Commercial distribution, resale, and monetized forks require prior written authorization.
+### Notes
+- Incremental archives contain changed/new files only.
+- Removed files are emitted as deletion tombstones and applied during unpack.

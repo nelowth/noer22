@@ -4,6 +4,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::io::{self, Read, Write};
+use std::path::Path;
 use zeroize::Zeroizing;
 
 pub const TAG_LEN: usize = 16;
@@ -27,11 +28,47 @@ pub fn random_nonce() -> Result<[u8; 12]> {
     Ok(nonce)
 }
 
+pub fn read_keyfile(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    let data = std::fs::read(path)?;
+    if data.is_empty() {
+        return Err(NoerError::InvalidFormat(format!(
+            "keyfile is empty: {}",
+            path.display()
+        )));
+    }
+    Ok(Zeroizing::new(data))
+}
+
 pub fn derive_key(
     password: &str,
     salt: &[u8; 16],
     params: KdfParams,
 ) -> Result<Zeroizing<[u8; 32]>> {
+    derive_key_material(Some(password), None, salt, params)
+}
+
+pub fn derive_key_material(
+    password: Option<&str>,
+    keyfile: Option<&[u8]>,
+    salt: &[u8; 16],
+    params: KdfParams,
+) -> Result<Zeroizing<[u8; 32]>> {
+    let mut material = Zeroizing::new(Vec::new());
+    if let Some(pass) = password {
+        material.extend_from_slice(pass.as_bytes());
+    }
+    if let Some(extra) = keyfile {
+        if !material.is_empty() {
+            material.push(0);
+        }
+        material.extend_from_slice(extra);
+    }
+    if material.is_empty() {
+        return Err(NoerError::InvalidFormat(
+            "password or keyfile is required".into(),
+        ));
+    }
+
     let argon_params = Params::new(
         params.mem_kib,
         params.iterations,
@@ -40,7 +77,7 @@ pub fn derive_key(
     )?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params);
     let mut key = Zeroizing::new([0u8; 32]);
-    argon2.hash_password_into(password.as_bytes(), salt, key.as_mut())?;
+    argon2.hash_password_into(material.as_slice(), salt, key.as_mut())?;
     Ok(key)
 }
 
@@ -49,6 +86,55 @@ fn algo_to_ring(algo: CryptoAlgo) -> Result<&'static aead::Algorithm> {
         CryptoAlgo::ChaCha20Poly1305 => Ok(&aead::CHACHA20_POLY1305),
         CryptoAlgo::Aes256Gcm => Ok(&aead::AES_256_GCM),
     }
+}
+
+pub fn encrypt_chunk_at_index(
+    algo: CryptoAlgo,
+    key_bytes: &[u8],
+    nonce_base: [u8; 12],
+    aad: &[u8],
+    chunk_index: usize,
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    let nonce = nonce_for_index(nonce_base, chunk_index)?;
+    let unbound = UnboundKey::new(algo_to_ring(algo)?, key_bytes)
+        .map_err(|_| NoerError::InvalidFormat("chave invalida".into()))?;
+    let key = LessSafeKey::new(unbound);
+
+    let mut ciphertext = plaintext.to_vec();
+    let tag = key
+        .seal_in_place_separate_tag(nonce, Aad::from(aad), &mut ciphertext)
+        .map_err(|_| NoerError::InvalidFormat("encryption failed".into()))?;
+
+    let total_len = ciphertext.len() + TAG_LEN;
+    if total_len > u32::MAX as usize {
+        return Err(NoerError::InvalidFormat("chunk grande demais".into()));
+    }
+
+    let mut encoded = Vec::with_capacity(4 + total_len);
+    encoded.extend_from_slice(&(total_len as u32).to_le_bytes());
+    encoded.extend_from_slice(&ciphertext);
+    encoded.extend_from_slice(tag.as_ref());
+    Ok(encoded)
+}
+
+fn nonce_for_index(base: [u8; 12], index: usize) -> Result<Nonce> {
+    if index > u32::MAX as usize {
+        return Err(NoerError::InvalidFormat("chunk index overflow".into()));
+    }
+
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&base[0..8]);
+    let base_counter = u32::from_be_bytes([base[8], base[9], base[10], base[11]]);
+    let counter = base_counter
+        .checked_add(index as u32)
+        .ok_or_else(|| NoerError::InvalidFormat("contador de nonce excedido".into()))?;
+
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes[0..8].copy_from_slice(&prefix);
+    nonce_bytes[8..12].copy_from_slice(&counter.to_be_bytes());
+    Nonce::try_assume_unique_for_key(&nonce_bytes)
+        .map_err(|_| NoerError::InvalidFormat("invalid nonce".into()))
 }
 
 #[derive(Clone)]

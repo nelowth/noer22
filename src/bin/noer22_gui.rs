@@ -1,11 +1,12 @@
 #![cfg(feature = "gui")]
 
 use eframe::{egui, NativeOptions};
-use noer22::cli::{CipherChoice, PackArgs, UnpackArgs, VerifyArgs};
+use noer22::cli::{ChecksumChoice, CipherChoice, PackArgs, UnpackArgs, VerifyArgs};
 use noer22::{pack, unpack};
 use rfd::FileDialog;
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -15,8 +16,8 @@ use std::time::{Duration, Instant};
 
 fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size(egui::vec2(560.0, 720.0))
-        .with_min_inner_size(egui::vec2(520.0, 680.0));
+        .with_inner_size(egui::vec2(640.0, 760.0))
+        .with_min_inner_size(egui::vec2(500.0, 620.0));
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -52,6 +53,20 @@ enum Mode {
     Verify,
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum PackAuthMode {
+    #[default]
+    PasswordKeyfile,
+    AgeRecipients,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum ArchiveAuthMode {
+    #[default]
+    PasswordKeyfile,
+    AgeIdentities,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StatusKind {
     Idle,
@@ -78,10 +93,15 @@ impl StatusState {
 
 struct GuiApp {
     mode: Mode,
+    pack_auth_mode: PackAuthMode,
+    archive_auth_mode: ArchiveAuthMode,
     inputs: Vec<PathBuf>,
     pack_output: Option<PathBuf>,
     archive: Option<PathBuf>,
     unpack_output: Option<PathBuf>,
+    keyfile: Option<PathBuf>,
+    age_recipients_text: String,
+    age_identities: Vec<PathBuf>,
     password: String,
     confirm_password: String,
     show_password: bool,
@@ -91,6 +111,14 @@ struct GuiApp {
     kdf_iters: u32,
     kdf_parallelism: u32,
     threads: usize,
+    parallel_crypto: bool,
+    incremental_index: Option<PathBuf>,
+    pack_checksum: Option<ChecksumChoice>,
+    pack_checksum_output: Option<PathBuf>,
+    unpack_checksum_file: Option<PathBuf>,
+    unpack_checksum_algo: Option<ChecksumChoice>,
+    verify_checksum_file: Option<PathBuf>,
+    verify_checksum_algo: Option<ChecksumChoice>,
     status: Arc<Mutex<StatusState>>,
     running: Arc<AtomicBool>,
     total_input: u64,
@@ -98,7 +126,9 @@ struct GuiApp {
     est_output: u64,
     archive_size: u64,
     list_long: bool,
+    list_filter: String,
     inspect_result: Arc<Mutex<Option<unpack::ArchiveOverview>>>,
+    last_dir: Option<PathBuf>,
     gold_particles: Vec<Particle>,
     crimson_particles: Vec<Particle>,
     noise: Vec<NoiseDot>,
@@ -117,19 +147,32 @@ impl Default for GuiApp {
     fn default() -> Self {
         Self {
             mode: Mode::Pack,
+            pack_auth_mode: PackAuthMode::PasswordKeyfile,
+            archive_auth_mode: ArchiveAuthMode::PasswordKeyfile,
             inputs: Vec::new(),
             pack_output: None,
             archive: None,
             unpack_output: None,
+            keyfile: None,
+            age_recipients_text: String::new(),
+            age_identities: Vec::new(),
             password: String::new(),
             confirm_password: String::new(),
             show_password: false,
-            level: 6,
+            level: 8,
             cipher: CipherChoice::ChaCha20Poly1305,
             kdf_mem: 64,
             kdf_iters: 3,
             kdf_parallelism: 4,
             threads: 0,
+            parallel_crypto: false,
+            incremental_index: None,
+            pack_checksum: None,
+            pack_checksum_output: None,
+            unpack_checksum_file: None,
+            unpack_checksum_algo: None,
+            verify_checksum_file: None,
+            verify_checksum_algo: None,
             status: Arc::new(Mutex::new(StatusState::new("Ready", StatusKind::Idle))),
             running: Arc::new(AtomicBool::new(false)),
             total_input: 0,
@@ -137,7 +180,9 @@ impl Default for GuiApp {
             est_output: 0,
             archive_size: 0,
             list_long: false,
+            list_filter: String::new(),
             inspect_result: Arc::new(Mutex::new(None)),
+            last_dir: None,
             gold_particles: make_particles(42, 0xCAFE_BABE, 1.0, 2.6, 0.008, 0.03, 24, 44),
             crimson_particles: make_particles(28, 0xFEED_FACE, 1.8, 3.8, 0.012, 0.05, 36, 80),
             noise: make_noise(140, 0x0BADC0DE),
@@ -280,11 +325,7 @@ impl GuiApp {
             }
             Mode::Unpack => {
                 metric_card(ui, "Archive", &human_bytes(self.archive_size), accent);
-                let output = self
-                    .unpack_output
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "Current folder".into());
+                let output = self.effective_unpack_output().display().to_string();
                 metric_card(ui, "Output", &output, accent);
                 let count = inspection
                     .as_ref()
@@ -317,15 +358,13 @@ impl GuiApp {
         card(ui, "Inputs", |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.add(gold_button("Add Files")).clicked() {
-                    if let Some(paths) = FileDialog::new().pick_files() {
-                        self.inputs.extend(paths);
-                        self.recompute_estimates();
+                    if let Some(paths) = self.new_dialog().pick_files() {
+                        self.add_input_paths(paths);
                     }
                 }
                 if ui.add(gold_button("Add Folder")).clicked() {
-                    if let Some(path) = FileDialog::new().pick_folder() {
-                        self.inputs.push(path);
-                        self.recompute_estimates();
+                    if let Some(path) = self.new_dialog().pick_folder() {
+                        self.add_input_paths([path]);
                     }
                 }
                 if ui.add(dark_button("Clear")).clicked() {
@@ -385,11 +424,19 @@ impl GuiApp {
             }
         });
 
-        card(ui, "Output & Password", |ui| {
+        card(ui, "Output & Authentication", |ui| {
             ui.horizontal(|ui| {
                 if ui.add(gold_button("Choose Output")).clicked() {
-                    if let Some(path) = FileDialog::new().set_file_name("archive.noer").save_file()
-                    {
+                    let suggested = self.effective_pack_output();
+                    let mut dialog = self.new_dialog();
+                    if let Some(parent) = suggested.parent() {
+                        dialog = dialog.set_directory(parent);
+                    }
+                    if let Some(name) = suggested.file_name().and_then(|v| v.to_str()) {
+                        dialog = dialog.set_file_name(name);
+                    }
+                    if let Some(path) = dialog.save_file() {
+                        self.remember_path(&path);
                         self.pack_output = Some(path);
                     }
                 }
@@ -397,41 +444,130 @@ impl GuiApp {
                     self.pack_output
                         .as_ref()
                         .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "archive.noer (default)".into()),
+                        .unwrap_or_else(|| self.effective_pack_output().display().to_string()),
                 );
             });
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label("Password");
-                ui.checkbox(&mut self.show_password, "show");
-            });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.password)
-                    .password(!self.show_password)
-                    .hint_text("minimum 8 characters"),
-            );
-            ui.add_space(4.0);
-            ui.label("Confirm password");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.confirm_password)
-                    .password(!self.show_password)
-                    .hint_text("repeat password"),
-            );
-
-            let (strength, label, color) = password_strength(&self.password);
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.colored_label(color, format!("Strength: {label}"));
-                ui.add(
-                    egui::ProgressBar::new(strength)
-                        .desired_width(140.0)
-                        .fill(color),
+                ui.label("Auth mode");
+                ui.selectable_value(
+                    &mut self.pack_auth_mode,
+                    PackAuthMode::PasswordKeyfile,
+                    "Password/Keyfile",
+                );
+                ui.selectable_value(
+                    &mut self.pack_auth_mode,
+                    PackAuthMode::AgeRecipients,
+                    "Age recipients",
                 );
             });
 
-            if !self.confirm_password.is_empty() && self.password != self.confirm_password {
-                ui.colored_label(rgb(120, 30, 22), "Passwords do not match.");
+            match self.pack_auth_mode {
+                PackAuthMode::PasswordKeyfile => {
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(dark_button("Choose Keyfile")).clicked() {
+                            if let Some(path) = self.new_dialog().pick_file() {
+                                self.remember_path(&path);
+                                self.keyfile = Some(path);
+                            }
+                        }
+                        if self.keyfile.is_some() && ui.add(dark_button("Clear Keyfile")).clicked()
+                        {
+                            self.keyfile = None;
+                        }
+                        ui.label(
+                            self.keyfile
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "No keyfile".into()),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Password");
+                        ui.checkbox(&mut self.show_password, "show");
+                    });
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.password)
+                            .password(!self.show_password)
+                            .hint_text("minimum 8 characters"),
+                    );
+                    ui.add_space(4.0);
+                    ui.label("Confirm password");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.confirm_password)
+                            .password(!self.show_password)
+                            .hint_text("repeat password"),
+                    );
+
+                    let (strength, label, color) = password_strength(&self.password);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(color, format!("Strength: {label}"));
+                        ui.add(
+                            egui::ProgressBar::new(strength)
+                                .desired_width(140.0)
+                                .fill(color),
+                        );
+                    });
+
+                    if !self.password.is_empty()
+                        && !self.confirm_password.is_empty()
+                        && self.password != self.confirm_password
+                    {
+                        ui.colored_label(rgb(120, 30, 22), "Passwords do not match.");
+                    }
+                    if self.password.is_empty() && self.keyfile.is_none() {
+                        ui.colored_label(
+                            rgb(191, 164, 111),
+                            "Use at least one auth material: password or keyfile.",
+                        );
+                    }
+                }
+                PackAuthMode::AgeRecipients => {
+                    ui.add_space(8.0);
+                    ui.label("Age recipients (one per line or separated by comma/space):");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.age_recipients_text)
+                            .desired_rows(4)
+                            .hint_text("age1...\nage1..."),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(dark_button("Load Recipients File")).clicked() {
+                            if let Some(path) = self.new_dialog().pick_file() {
+                                self.remember_path(&path);
+                                match fs::read_to_string(&path) {
+                                    Ok(content) => {
+                                        if !self.age_recipients_text.trim().is_empty() {
+                                            self.age_recipients_text.push('\n');
+                                        }
+                                        self.age_recipients_text.push_str(content.trim());
+                                    }
+                                    Err(err) => set_status(
+                                        &self.status,
+                                        StatusKind::Warning,
+                                        &format!("Could not read recipients file: {err}"),
+                                    ),
+                                }
+                            }
+                        }
+                        if ui.add(dark_button("Clear Recipients")).clicked() {
+                            self.age_recipients_text.clear();
+                        }
+                    });
+
+                    let count = parse_age_recipients(&self.age_recipients_text).len();
+                    ui.label(format!("Recipients detected: {count}"));
+                    if count == 0 {
+                        ui.colored_label(
+                            rgb(191, 164, 111),
+                            "Add at least one valid age recipient (age1...).",
+                        );
+                    }
+                }
             }
         });
 
@@ -471,6 +607,80 @@ impl GuiApp {
                 }
             });
 
+            ui.add_space(6.0);
+            ui.checkbox(
+                &mut self.parallel_crypto,
+                "Parallel Crypto (experimental deterministic pipeline)",
+            );
+
+            ui.add_space(6.0);
+            ui.label("Incremental index (.json, optional)");
+            ui.horizontal_wrapped(|ui| {
+                if ui.add(dark_button("Choose Index")).clicked() {
+                    if let Some(path) = self.new_dialog().set_file_name("index.json").save_file() {
+                        self.remember_path(&path);
+                        self.incremental_index = Some(path);
+                    }
+                }
+                if self.incremental_index.is_some() && ui.add(dark_button("Clear Index")).clicked()
+                {
+                    self.incremental_index = None;
+                }
+                ui.label(
+                    self.incremental_index
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "Disabled".into()),
+                );
+            });
+
+            ui.add_space(6.0);
+            ui.label("Checksum sidecar (optional)");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.pack_checksum, None, "None");
+                ui.selectable_value(
+                    &mut self.pack_checksum,
+                    Some(ChecksumChoice::Sha256),
+                    "SHA-256",
+                );
+                ui.selectable_value(
+                    &mut self.pack_checksum,
+                    Some(ChecksumChoice::Blake3),
+                    "BLAKE3",
+                );
+            });
+            if self.pack_checksum.is_some() {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(dark_button("Choose Checksum Output")).clicked() {
+                        let suggested = self.effective_pack_checksum_output();
+                        let mut dialog = self.new_dialog();
+                        if let Some(parent) = suggested.parent() {
+                            dialog = dialog.set_directory(parent);
+                        }
+                        if let Some(name) = suggested.file_name().and_then(|n| n.to_str()) {
+                            dialog = dialog.set_file_name(name);
+                        }
+                        if let Some(path) = dialog.save_file() {
+                            self.remember_path(&path);
+                            self.pack_checksum_output = Some(path);
+                        }
+                    }
+                    if self.pack_checksum_output.is_some()
+                        && ui.add(dark_button("Clear Checksum Output")).clicked()
+                    {
+                        self.pack_checksum_output = None;
+                    }
+                });
+                ui.label(
+                    self.pack_checksum_output
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| {
+                            self.effective_pack_checksum_output().display().to_string()
+                        }),
+                );
+            }
+
             egui::CollapsingHeader::new("Advanced Settings")
                 .default_open(false)
                 .show(ui, |ui| {
@@ -499,10 +709,15 @@ impl GuiApp {
 
         let can_pack = self.can_pack();
         if !can_pack {
-            ui.colored_label(
-                rgb(191, 164, 111),
-                "Select inputs and confirm your password to continue.",
-            );
+            let msg = match self.pack_auth_mode {
+                PackAuthMode::PasswordKeyfile => {
+                    "Select inputs and provide password (with confirmation) or keyfile."
+                }
+                PackAuthMode::AgeRecipients => {
+                    "Select inputs and provide at least one age recipient."
+                }
+            };
+            ui.colored_label(rgb(191, 164, 111), msg);
         }
 
         if ui
@@ -522,10 +737,9 @@ impl GuiApp {
         card(ui, "Archive (.noer)", |ui| {
             ui.horizontal(|ui| {
                 if ui.add(gold_button("Choose .noer")).clicked() {
-                    if let Some(path) = FileDialog::new().add_filter("noer", &["noer"]).pick_file()
+                    if let Some(path) = self.new_dialog().add_filter("noer", &["noer"]).pick_file()
                     {
-                        self.archive = Some(path);
-                        self.refresh_archive_meta();
+                        self.set_archive_path(path);
                     }
                 }
                 ui.label(
@@ -541,35 +755,70 @@ impl GuiApp {
             }
         });
 
-        card(ui, "Output & Password", |ui| {
+        card(ui, "Output & Authentication", |ui| {
             if ui.add(gold_button("Select Output Folder")).clicked() {
-                if let Some(path) = FileDialog::new().pick_folder() {
+                if let Some(path) = self.new_dialog().pick_folder() {
+                    self.remember_path(&path);
                     self.unpack_output = Some(path);
                 }
+            }
+            if self.unpack_output.is_some() && ui.add(dark_button("Clear Output Folder")).clicked()
+            {
+                self.unpack_output = None;
             }
             ui.label(
                 self.unpack_output
                     .as_ref()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "Current folder".into()),
+                    .unwrap_or_else(|| self.effective_unpack_output().display().to_string()),
             );
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("Password");
-                ui.checkbox(&mut self.show_password, "show");
+            self.show_archive_auth_ui(ui, true);
+            ui.add_space(8.0);
+            ui.label("Checksum pre-check (optional)");
+            ui.horizontal_wrapped(|ui| {
+                if ui.add(dark_button("Choose Checksum File")).clicked() {
+                    if let Some(path) = self.new_dialog().pick_file() {
+                        self.remember_path(&path);
+                        self.unpack_checksum_file = Some(path);
+                    }
+                }
+                if self.unpack_checksum_file.is_some()
+                    && ui.add(dark_button("Clear Checksum File")).clicked()
+                {
+                    self.unpack_checksum_file = None;
+                    self.unpack_checksum_algo = None;
+                }
+                ui.label(
+                    self.unpack_checksum_file
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "Disabled".into()),
+                );
             });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.password)
-                    .password(!self.show_password)
-                    .hint_text("archive password"),
-            );
+            if self.unpack_checksum_file.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label("Checksum algorithm");
+                    ui.selectable_value(&mut self.unpack_checksum_algo, None, "Auto");
+                    ui.selectable_value(
+                        &mut self.unpack_checksum_algo,
+                        Some(ChecksumChoice::Sha256),
+                        "SHA-256",
+                    );
+                    ui.selectable_value(
+                        &mut self.unpack_checksum_algo,
+                        Some(ChecksumChoice::Blake3),
+                        "BLAKE3",
+                    );
+                });
+            }
         });
 
         let can_unpack = self.can_unpack();
         if !can_unpack {
             ui.colored_label(
                 rgb(191, 164, 111),
-                "Select a .noer file and enter its password.",
+                "Select a .noer file and provide matching auth material.",
             );
         }
 
@@ -593,10 +842,9 @@ impl GuiApp {
         card(ui, "Archive (.noer)", |ui| {
             ui.horizontal(|ui| {
                 if ui.add(gold_button("Choose .noer")).clicked() {
-                    if let Some(path) = FileDialog::new().add_filter("noer", &["noer"]).pick_file()
+                    if let Some(path) = self.new_dialog().add_filter("noer", &["noer"]).pick_file()
                     {
-                        self.archive = Some(path);
-                        self.refresh_archive_meta();
+                        self.set_archive_path(path);
                     }
                 }
                 ui.label(
@@ -613,23 +861,20 @@ impl GuiApp {
         });
 
         card(ui, "Authentication", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Password");
-                ui.checkbox(&mut self.show_password, "show");
-            });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.password)
-                    .password(!self.show_password)
-                    .hint_text("archive password"),
-            );
+            self.show_archive_auth_ui(ui, true);
+            ui.add_space(6.0);
             ui.checkbox(&mut self.list_long, "Detailed listing");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.list_filter)
+                    .hint_text("Filter entries by path (optional)"),
+            );
         });
 
         let can_list = self.can_list();
         if !can_list {
             ui.colored_label(
                 rgb(191, 164, 111),
-                "Select a .noer file and enter its password.",
+                "Select a .noer file and provide matching auth material.",
             );
         }
 
@@ -654,6 +899,16 @@ impl GuiApp {
                     info.crypto_name, info.kdf_mem_mib, info.kdf_iters, info.kdf_parallelism
                 ));
 
+                let filter = self.list_filter.trim().to_lowercase();
+                let shown = info
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        filter.is_empty() || entry.path.to_lowercase().contains(&filter)
+                    })
+                    .count();
+                ui.label(format!("Visible entries: {shown}"));
+
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical()
                     .max_height(220.0)
@@ -661,7 +916,12 @@ impl GuiApp {
                         if self.list_long {
                             ui.monospace("TYPE  SIZE         MODIFIED    MODE   PATH");
                         }
+                        let mut rendered = 0usize;
                         for entry in &info.entries {
+                            if !filter.is_empty() && !entry.path.to_lowercase().contains(&filter) {
+                                continue;
+                            }
+                            rendered += 1;
                             if self.list_long {
                                 let kind = if entry.is_dir { "dir " } else { "file" };
                                 let size = if entry.is_dir {
@@ -683,6 +943,9 @@ impl GuiApp {
                                 ));
                             }
                         }
+                        if rendered == 0 {
+                            ui.label("No entries match the current filter.");
+                        }
                     });
             });
         }
@@ -697,10 +960,9 @@ impl GuiApp {
         card(ui, "Archive (.noer)", |ui| {
             ui.horizontal(|ui| {
                 if ui.add(gold_button("Choose .noer")).clicked() {
-                    if let Some(path) = FileDialog::new().add_filter("noer", &["noer"]).pick_file()
+                    if let Some(path) = self.new_dialog().add_filter("noer", &["noer"]).pick_file()
                     {
-                        self.archive = Some(path);
-                        self.refresh_archive_meta();
+                        self.set_archive_path(path);
                     }
                 }
                 ui.label(
@@ -717,22 +979,52 @@ impl GuiApp {
         });
 
         card(ui, "Authentication", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Password");
-                ui.checkbox(&mut self.show_password, "show");
+            self.show_archive_auth_ui(ui, false);
+            ui.add_space(8.0);
+            ui.label("Checksum sidecar (optional, enables checksum-only verify)");
+            ui.horizontal_wrapped(|ui| {
+                if ui.add(dark_button("Choose Checksum File")).clicked() {
+                    if let Some(path) = self.new_dialog().pick_file() {
+                        self.remember_path(&path);
+                        self.verify_checksum_file = Some(path);
+                    }
+                }
+                if self.verify_checksum_file.is_some()
+                    && ui.add(dark_button("Clear Checksum File")).clicked()
+                {
+                    self.verify_checksum_file = None;
+                    self.verify_checksum_algo = None;
+                }
+                ui.label(
+                    self.verify_checksum_file
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "Disabled".into()),
+                );
             });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.password)
-                    .password(!self.show_password)
-                    .hint_text("archive password"),
-            );
+            if self.verify_checksum_file.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label("Checksum algorithm");
+                    ui.selectable_value(&mut self.verify_checksum_algo, None, "Auto");
+                    ui.selectable_value(
+                        &mut self.verify_checksum_algo,
+                        Some(ChecksumChoice::Sha256),
+                        "SHA-256",
+                    );
+                    ui.selectable_value(
+                        &mut self.verify_checksum_algo,
+                        Some(ChecksumChoice::Blake3),
+                        "BLAKE3",
+                    );
+                });
+            }
         });
 
         let can_verify = self.can_verify();
         if !can_verify {
             ui.colored_label(
                 rgb(191, 164, 111),
-                "Select a .noer file and enter its password.",
+                "Select a .noer file and provide auth material or checksum file.",
             );
         }
 
@@ -753,6 +1045,9 @@ impl GuiApp {
             ui.horizontal(|ui| {
                 ui.colored_label(color, status_label(status.kind));
                 ui.label(&status.message);
+                if ui.add(dark_button("Copy")).clicked() {
+                    ui.ctx().copy_text(status.message.clone());
+                }
                 if status.kind == StatusKind::Running {
                     ui.add(egui::Spinner::new());
                 }
@@ -770,21 +1065,250 @@ impl GuiApp {
     }
 
     fn can_pack(&self) -> bool {
-        !self.inputs.is_empty()
-            && !self.password.is_empty()
-            && self.password == self.confirm_password
+        !self.inputs.is_empty() && self.has_pack_auth_material()
     }
 
     fn can_unpack(&self) -> bool {
-        self.archive.is_some() && !self.password.is_empty()
+        self.archive.is_some() && self.has_archive_auth_material()
     }
 
     fn can_list(&self) -> bool {
-        self.archive.is_some() && !self.password.is_empty()
+        self.archive.is_some() && self.has_archive_auth_material()
     }
 
     fn can_verify(&self) -> bool {
-        self.archive.is_some() && !self.password.is_empty()
+        self.archive.is_some()
+            && (self.has_archive_auth_material() || self.verify_checksum_file.is_some())
+    }
+
+    fn has_pack_auth_material(&self) -> bool {
+        match self.pack_auth_mode {
+            PackAuthMode::PasswordKeyfile => {
+                if self.password.is_empty() {
+                    self.keyfile.is_some()
+                } else {
+                    self.password == self.confirm_password
+                }
+            }
+            PackAuthMode::AgeRecipients => {
+                !parse_age_recipients(&self.age_recipients_text).is_empty()
+            }
+        }
+    }
+
+    fn has_archive_auth_material(&self) -> bool {
+        match self.archive_auth_mode {
+            ArchiveAuthMode::PasswordKeyfile => !self.password.is_empty() || self.keyfile.is_some(),
+            ArchiveAuthMode::AgeIdentities => !self.age_identities.is_empty(),
+        }
+    }
+
+    fn show_archive_auth_ui(&mut self, ui: &mut egui::Ui, auth_required: bool) {
+        ui.horizontal(|ui| {
+            ui.label("Auth mode");
+            ui.selectable_value(
+                &mut self.archive_auth_mode,
+                ArchiveAuthMode::PasswordKeyfile,
+                "Password/Keyfile",
+            );
+            ui.selectable_value(
+                &mut self.archive_auth_mode,
+                ArchiveAuthMode::AgeIdentities,
+                "Age identities",
+            );
+        });
+        ui.add_space(6.0);
+
+        match self.archive_auth_mode {
+            ArchiveAuthMode::PasswordKeyfile => {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(dark_button("Choose Keyfile")).clicked() {
+                        if let Some(path) = self.new_dialog().pick_file() {
+                            self.remember_path(&path);
+                            self.keyfile = Some(path);
+                        }
+                    }
+                    if self.keyfile.is_some() && ui.add(dark_button("Clear Keyfile")).clicked() {
+                        self.keyfile = None;
+                    }
+                    ui.label(
+                        self.keyfile
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "No keyfile".into()),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Password");
+                    ui.checkbox(&mut self.show_password, "show");
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.password)
+                        .password(!self.show_password)
+                        .hint_text("archive password"),
+                );
+            }
+            ArchiveAuthMode::AgeIdentities => {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(gold_button("Add Identity Files")).clicked() {
+                        if let Some(paths) = self.new_dialog().pick_files() {
+                            self.add_identity_paths(paths);
+                        }
+                    }
+                    if ui.add(dark_button("Clear Identities")).clicked() {
+                        self.age_identities.clear();
+                    }
+                    ui.label(format!("Loaded: {}", self.age_identities.len()));
+                });
+                if self.age_identities.is_empty() {
+                    if auth_required {
+                        ui.colored_label(rgb(191, 164, 111), "Add one or more age identity files.");
+                    } else {
+                        ui.label("No identity loaded (OK for checksum-only verify).");
+                    }
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(88.0)
+                        .show(ui, |ui| {
+                            let mut remove_idx: Option<usize> = None;
+                            for (idx, path) in self.age_identities.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    if ui.add(dark_button("x")).clicked() {
+                                        remove_idx = Some(idx);
+                                    }
+                                    ui.label(path.display().to_string());
+                                });
+                            }
+                            if let Some(idx) = remove_idx {
+                                self.age_identities.remove(idx);
+                            }
+                        });
+                }
+            }
+        }
+    }
+
+    fn add_identity_paths<I>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let mut seen: HashSet<String> = self.age_identities.iter().map(|p| path_key(p)).collect();
+        for path in paths {
+            if !path.is_file() {
+                continue;
+            }
+            let key = path_key(&path);
+            if seen.insert(key) {
+                self.remember_path(&path);
+                self.age_identities.push(path);
+            }
+        }
+    }
+
+    fn new_dialog(&self) -> FileDialog {
+        let dir = self
+            .last_dir
+            .as_ref()
+            .filter(|p| p.exists())
+            .cloned()
+            .unwrap_or_else(default_user_dir);
+        FileDialog::new().set_directory(dir)
+    }
+
+    fn remember_path(&mut self, path: &Path) {
+        let dir = if path.is_dir() {
+            Some(path.to_path_buf())
+        } else {
+            path.parent().map(Path::to_path_buf)
+        };
+        if let Some(dir) = dir {
+            self.last_dir = Some(dir);
+        }
+    }
+
+    fn add_input_paths<I>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let mut seen: HashSet<String> = self.inputs.iter().map(|p| path_key(p)).collect();
+        for path in paths {
+            if !path.exists() {
+                continue;
+            }
+            let key = path_key(&path);
+            if seen.insert(key) {
+                self.remember_path(&path);
+                self.inputs.push(path);
+            }
+        }
+        self.recompute_estimates();
+    }
+
+    fn set_archive_path(&mut self, path: PathBuf) {
+        if !is_noer_file(&path) {
+            set_status(
+                &self.status,
+                StatusKind::Warning,
+                "Select a valid .noer archive file.",
+            );
+            return;
+        }
+        self.remember_path(&path);
+        self.archive = Some(path);
+        self.refresh_archive_meta();
+    }
+
+    fn effective_pack_output(&self) -> PathBuf {
+        if let Some(path) = self.pack_output.as_ref() {
+            return path.clone();
+        }
+        let base = self
+            .inputs
+            .first()
+            .and_then(|p| {
+                if p.is_dir() {
+                    Some(p.clone())
+                } else {
+                    p.parent().map(Path::to_path_buf)
+                }
+            })
+            .unwrap_or_else(default_user_dir);
+        let stem = self
+            .inputs
+            .first()
+            .and_then(|p| p.file_stem().or_else(|| p.file_name()))
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("archive");
+        base.join(format!("{stem}.noer"))
+    }
+
+    fn effective_pack_checksum_output(&self) -> PathBuf {
+        let suffix = match self.pack_checksum.unwrap_or(ChecksumChoice::Sha256) {
+            ChecksumChoice::Sha256 => "sha256",
+            ChecksumChoice::Blake3 => "blake3",
+        };
+        append_path_suffix(&self.effective_pack_output(), suffix)
+    }
+
+    fn effective_unpack_output(&self) -> PathBuf {
+        if let Some(path) = self.unpack_output.as_ref() {
+            return path.clone();
+        }
+        if let Some(archive) = self.archive.as_ref() {
+            let base = archive
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(default_user_dir);
+            let stem = archive
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("archive");
+            return base.join(format!("{stem}_out"));
+        }
+        default_user_dir().join("noer22_out")
     }
 
     fn recompute_estimates(&mut self) {
@@ -807,19 +1331,19 @@ impl GuiApp {
     fn apply_preset(&mut self, preset: Preset) {
         match preset {
             Preset::Fast => {
-                self.level = 1;
+                self.level = 3;
                 self.kdf_mem = 32;
                 self.kdf_iters = 2;
                 self.kdf_parallelism = 2;
             }
             Preset::Balanced => {
-                self.level = 6;
+                self.level = 8;
                 self.kdf_mem = 64;
                 self.kdf_iters = 3;
                 self.kdf_parallelism = 4;
             }
             Preset::Secure => {
-                self.level = 9;
+                self.level = 12;
                 self.kdf_mem = 128;
                 self.kdf_iters = 4;
                 self.kdf_parallelism = 4;
@@ -837,11 +1361,27 @@ impl GuiApp {
             );
             return;
         }
-        if self.password.is_empty() {
-            set_status(&self.status, StatusKind::Warning, "Enter a password.");
+
+        let use_age = self.pack_auth_mode == PackAuthMode::AgeRecipients;
+        let age_recipients = parse_age_recipients(&self.age_recipients_text);
+
+        if use_age && age_recipients.is_empty() {
+            set_status(
+                &self.status,
+                StatusKind::Warning,
+                "Add at least one age recipient.",
+            );
             return;
         }
-        if self.password != self.confirm_password {
+        if !use_age && self.password.is_empty() && self.keyfile.is_none() {
+            set_status(
+                &self.status,
+                StatusKind::Warning,
+                "Provide a password or keyfile.",
+            );
+            return;
+        }
+        if !use_age && !self.password.is_empty() && self.password != self.confirm_password {
             set_status(
                 &self.status,
                 StatusKind::Warning,
@@ -849,35 +1389,56 @@ impl GuiApp {
             );
             return;
         }
+
         let inputs = self.inputs.clone();
-        let output = self.pack_output.clone();
-        let password = self.password.clone();
+        let target_path = self.effective_pack_output();
+        let password = if use_age || self.password.is_empty() {
+            None
+        } else {
+            Some(self.password.clone())
+        };
+        let keyfile = if use_age { None } else { self.keyfile.clone() };
         let cipher = self.cipher;
         let level = self.level;
         let kdf_mem = self.kdf_mem;
         let kdf_iters = self.kdf_iters;
         let kdf_parallelism = self.kdf_parallelism;
         let threads = self.threads;
+        let parallel_crypto = self.parallel_crypto;
+        let incremental_index = self.incremental_index.clone();
+        let checksum = self.pack_checksum;
+        let checksum_output = if checksum.is_some() {
+            Some(
+                self.pack_checksum_output
+                    .clone()
+                    .unwrap_or_else(|| self.effective_pack_checksum_output()),
+            )
+        } else {
+            None
+        };
         let status = self.status.clone();
         let running = self.running.clone();
         self.job_started = Some(Instant::now());
         running.store(true, Ordering::Relaxed);
         set_status(&status, StatusKind::Running, "Packing archive...");
         thread::spawn(move || {
-            let target_path = output
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("archive.noer"));
             let result = std::panic::catch_unwind(|| {
                 pack::pack(PackArgs {
                     inputs,
                     output: target_path.clone(),
                     password,
+                    keyfile,
+                    age_recipients,
                     level,
                     cipher,
                     kdf_mem,
                     kdf_iters,
                     kdf_parallelism,
                     threads: if threads == 0 { None } else { Some(threads) },
+                    parallel_crypto,
+                    incremental_index,
+                    checksum,
+                    checksum_output,
                 })
             });
             match result {
@@ -898,21 +1459,52 @@ impl GuiApp {
     }
 
     fn run_unpack(&mut self) {
-        if self.archive.is_none() {
+        let archive = match self.archive.clone() {
+            Some(path) => path,
+            None => {
+                set_status(
+                    &self.status,
+                    StatusKind::Warning,
+                    "Select a .noer archive file.",
+                );
+                return;
+            }
+        };
+        let using_age = self.archive_auth_mode == ArchiveAuthMode::AgeIdentities;
+        if using_age && self.age_identities.is_empty() {
             set_status(
                 &self.status,
                 StatusKind::Warning,
-                "Select a .noer archive file.",
+                "Add at least one age identity file.",
             );
             return;
         }
-        if self.password.is_empty() {
-            set_status(&self.status, StatusKind::Warning, "Enter a password.");
+        if !using_age && self.password.is_empty() && self.keyfile.is_none() {
+            set_status(
+                &self.status,
+                StatusKind::Warning,
+                "Provide password or keyfile.",
+            );
             return;
         }
-        let archive = self.archive.clone();
-        let output = self.unpack_output.clone();
-        let password = self.password.clone();
+        let output = Some(self.effective_unpack_output());
+        let password = if using_age || self.password.is_empty() {
+            None
+        } else {
+            Some(self.password.clone())
+        };
+        let keyfile = if using_age {
+            None
+        } else {
+            self.keyfile.clone()
+        };
+        let age_identities = if using_age {
+            self.age_identities.clone()
+        } else {
+            Vec::new()
+        };
+        let checksum_file = self.unpack_checksum_file.clone();
+        let checksum_algo = self.unpack_checksum_algo;
         let status = self.status.clone();
         let running = self.running.clone();
         self.job_started = Some(Instant::now());
@@ -921,9 +1513,13 @@ impl GuiApp {
         thread::spawn(move || {
             let result = std::panic::catch_unwind(|| {
                 unpack::unpack(UnpackArgs {
-                    archive: archive.unwrap_or_else(|| PathBuf::from("archive.noer")),
+                    archive,
                     password,
+                    keyfile,
+                    age_identities,
                     output,
+                    checksum_file,
+                    checksum_algo,
                 })
             });
             match result {
@@ -940,21 +1536,49 @@ impl GuiApp {
     }
 
     fn run_list(&mut self) {
-        if self.archive.is_none() {
+        let archive_path = match self.archive.clone() {
+            Some(path) => path,
+            None => {
+                set_status(
+                    &self.status,
+                    StatusKind::Warning,
+                    "Select a .noer archive file.",
+                );
+                return;
+            }
+        };
+        let using_age = self.archive_auth_mode == ArchiveAuthMode::AgeIdentities;
+        if using_age && self.age_identities.is_empty() {
             set_status(
                 &self.status,
                 StatusKind::Warning,
-                "Select a .noer archive file.",
+                "Add at least one age identity file.",
             );
             return;
         }
-        if self.password.is_empty() {
-            set_status(&self.status, StatusKind::Warning, "Enter a password.");
+        if !using_age && self.password.is_empty() && self.keyfile.is_none() {
+            set_status(
+                &self.status,
+                StatusKind::Warning,
+                "Provide password or keyfile.",
+            );
             return;
         }
-
-        let archive = self.archive.clone();
-        let password = self.password.clone();
+        let password = if using_age || self.password.is_empty() {
+            None
+        } else {
+            Some(self.password.clone())
+        };
+        let keyfile = if using_age {
+            None
+        } else {
+            self.keyfile.clone()
+        };
+        let age_identities = if using_age {
+            self.age_identities.clone()
+        } else {
+            Vec::new()
+        };
         let detailed = self.list_long;
         let status = self.status.clone();
         let running = self.running.clone();
@@ -965,9 +1589,14 @@ impl GuiApp {
         set_status(&status, StatusKind::Running, "Inspecting archive...");
 
         thread::spawn(move || {
-            let archive_path = archive.unwrap_or_else(|| PathBuf::from("archive.noer"));
             let result = std::panic::catch_unwind(|| {
-                unpack::inspect_archive(&archive_path, &password).map(|info| {
+                unpack::inspect_archive_with_auth(
+                    &archive_path,
+                    password.as_deref(),
+                    keyfile.as_deref(),
+                    &age_identities,
+                )
+                .map(|info| {
                     if detailed {
                         info
                     } else {
@@ -999,21 +1628,49 @@ impl GuiApp {
     }
 
     fn run_verify(&mut self) {
-        if self.archive.is_none() {
+        let archive_path = match self.archive.clone() {
+            Some(path) => path,
+            None => {
+                set_status(
+                    &self.status,
+                    StatusKind::Warning,
+                    "Select a .noer archive file.",
+                );
+                return;
+            }
+        };
+        let using_age = self.archive_auth_mode == ArchiveAuthMode::AgeIdentities;
+        let has_checksum = self.verify_checksum_file.is_some();
+        let has_auth = if using_age {
+            !self.age_identities.is_empty()
+        } else {
+            !self.password.is_empty() || self.keyfile.is_some()
+        };
+        if !has_checksum && !has_auth {
             set_status(
                 &self.status,
                 StatusKind::Warning,
-                "Select a .noer archive file.",
+                "Provide auth material or checksum file.",
             );
             return;
         }
-        if self.password.is_empty() {
-            set_status(&self.status, StatusKind::Warning, "Enter a password.");
-            return;
-        }
-
-        let archive = self.archive.clone();
-        let password = self.password.clone();
+        let password = if using_age || self.password.is_empty() {
+            None
+        } else {
+            Some(self.password.clone())
+        };
+        let keyfile = if using_age {
+            None
+        } else {
+            self.keyfile.clone()
+        };
+        let age_identities = if using_age {
+            self.age_identities.clone()
+        } else {
+            Vec::new()
+        };
+        let checksum_file = self.verify_checksum_file.clone();
+        let checksum_algo = self.verify_checksum_algo;
         let status = self.status.clone();
         let running = self.running.clone();
         self.job_started = Some(Instant::now());
@@ -1025,11 +1682,14 @@ impl GuiApp {
         );
 
         thread::spawn(move || {
-            let archive_path = archive.unwrap_or_else(|| PathBuf::from("archive.noer"));
             let result = std::panic::catch_unwind(|| {
                 unpack::verify(VerifyArgs {
                     archive: archive_path,
                     password,
+                    keyfile,
+                    age_identities,
+                    checksum_file,
+                    checksum_algo,
                 })
             });
             match result {
@@ -1163,20 +1823,26 @@ impl GuiApp {
         }
         match self.mode {
             Mode::Pack => {
-                for file in dropped {
-                    if let Some(path) = file.path {
-                        self.inputs.push(path);
-                    }
-                }
-                self.recompute_estimates();
+                let paths: Vec<PathBuf> = dropped.into_iter().filter_map(|f| f.path).collect();
+                self.add_input_paths(paths);
             }
             Mode::Unpack | Mode::List | Mode::Verify => {
+                let mut selected = false;
                 for file in dropped {
                     if let Some(path) = file.path {
-                        self.archive = Some(path);
-                        self.refresh_archive_meta();
-                        break;
+                        if is_noer_file(&path) {
+                            self.set_archive_path(path);
+                            selected = true;
+                            break;
+                        }
                     }
+                }
+                if !selected {
+                    set_status(
+                        &self.status,
+                        StatusKind::Warning,
+                        "Drop a .noer file to select an archive.",
+                    );
                 }
             }
         }
@@ -1347,6 +2013,68 @@ fn human_bytes(bytes: u64) -> String {
         idx += 1;
     }
     format!("{:.2} {}", v, UNITS[idx])
+}
+
+fn default_user_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(home);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home);
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn is_noer_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("noer"))
+            .unwrap_or(false)
+}
+
+fn path_key(path: &Path) -> String {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = canonical.to_string_lossy().replace('\\', "/");
+    #[cfg(target_os = "windows")]
+    {
+        key.to_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        key
+    }
+}
+
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut rendered = path.as_os_str().to_os_string();
+    rendered.push(".");
+    rendered.push(suffix);
+    PathBuf::from(rendered)
+}
+
+fn parse_age_recipients(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in text
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        if !raw.starts_with("age1") {
+            continue;
+        }
+        let value = raw.to_string();
+        if seen.insert(value.clone()) {
+            out.push(value);
+        }
+    }
+    out
 }
 
 struct Particle {

@@ -2,6 +2,53 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.0] - 2026-02-11
+
+### Added
+- Optional keyfile authentication for `pack`, `unpack`, `list`, and `verify` (`--keyfile`).
+- Hybrid auth support (`password + keyfile`) and keyfile-only mode.
+- Optional public-key mode with age recipients (`--age-recipient`) and identities (`--age-identity`).
+- Incremental/delta packing via `--incremental-index <file>` using per-file BLAKE3 fingerprints.
+- Incremental deletion tombstones for removed files (applied during `unpack`).
+- External checksum sidecars during pack (`--checksum sha256|blake3`).
+- Checksum-only verify mode (`verify --checksum-file ...`) without password.
+- Optional pre-extract checksum validation in `unpack`.
+- New full-screen `ratatui` wizard (`noer22 wizard`) with pack/unpack/list/verify forms.
+- New modules: `checksum` and `incremental`.
+
+### Changed
+- Archive header now stores feature flags (`keyfile_required`, `incremental_archive`).
+- Archive header now stores feature flags (`keyfile_required`, `incremental_archive`, `age_recipients`).
+- `list` output now reports auth mode and archive mode (full/incremental).
+- `list` output now includes deletion entries (`[DEL]`) for incremental archives.
+- CLI auth model updated from password-only to password-or-keyfile where applicable.
+- Added `--parallel-crypto` experimental deterministic parallel chunk encryption path.
+- `pack` default compression level updated from `6` to `8` (better speed/ratio balance in measured mixed dataset).
+- GUI now supports both auth families end-to-end:
+  - password/keyfile and keyfile-only,
+  - age recipients in Pack,
+  - age identity files in Extract/List/Verify.
+- GUI now exposes checksum-sidecar workflows (pack sidecar output, extract pre-check, verify checksum-only mode).
+- GUI Pack now exposes incremental index and experimental `parallel-crypto` toggles.
+- GUI now validates dropped `.noer` files, deduplicates dropped inputs, and suggests OS-friendly default output paths.
+- Added `noer22_bench` binary for reproducible benchmark runs (noer22 + optional 7z comparison).
+
+### Security
+- Key derivation now supports combined key material from password and keyfile.
+- Added age-wrapped file-key envelope for recipient-based archives.
+- Archives marked as keyfile-protected now fail early when keyfile is missing.
+- Sidecar verification supports explicit algorithm matching to prevent confusion/mismatch.
+
+### Performance
+- Incremental hashing pipeline is parallelized with Rayon.
+- Existing multi-threaded zstd path remains available via `--threads`.
+
+### Tests
+- Added integration coverage for:
+  - keyfile-only roundtrip and missing-keyfile failure,
+  - checksum-sidecar verify without password,
+  - incremental mode packing only changed files.
+
 ## [0.2.0] - 2026-02-11
 
 ### Added

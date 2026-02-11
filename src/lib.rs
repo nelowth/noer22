@@ -1,10 +1,14 @@
+pub mod agewrap;
+pub mod checksum;
 pub mod cli;
 pub mod compression;
 pub mod crypto;
 pub mod error;
 pub mod format;
+pub mod incremental;
 pub mod metadata;
 pub mod pack;
+pub mod tui;
 pub mod unpack;
 pub mod utils;
 pub mod wizard;

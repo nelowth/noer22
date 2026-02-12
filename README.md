@@ -114,12 +114,17 @@ GUI usability updates:
 Run the built-in benchmark runner:
 
 ```bash
-cargo run --release --bin noer22_bench -- --input ./your_dataset
+cargo run --release --bin noer22_bench -- \
+  --input ./your_dataset \
+  --rounds 5 \
+  --warmup-rounds 1 \
+  --sample-ms 20
 ```
 
 Without `--input`, it generates a synthetic mixed dataset automatically.
-If `7z` exists in `PATH`, it also adds `7z` comparison rows.
+If `7z`/`7zz` and/or `rar` are available, it also adds those comparison rows.
 Outputs are written to `bench_run_<timestamp>/benchmark_results.{json,md}` by default.
+The report includes mean/stddev (multi-round), ratio, peak RSS, and peak CPU for `pack`/`extract`.
 
 ## Showcase (template)
 
@@ -154,6 +159,7 @@ screenshots at these paths:
 
 - Changelog: `CHANGELOG.md`
 - GitHub release notes draft: `RELEASE_NOTES.md`
+- Security design notes: `SECURITY.md`
 
 ## `.noer` Format (summary)
 
@@ -193,6 +199,7 @@ cargo build --release
 cargo build --release --features gui --bin noer22_gui
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+cargo audit
 ```
 
 ## License

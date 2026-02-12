@@ -24,7 +24,7 @@ pub fn progress_bar(total: u64, message: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);
     let style =
         ProgressStyle::with_template("{msg} [{bar:40.yellow/black}] {bytes}/{total_bytes} ({eta})")
-            .unwrap()
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("=>-");
     pb.set_style(style);
     pb.set_message(message.to_string());

@@ -1,5 +1,25 @@
 # Release Notes (GitHub-ready)
 
+## noer22 v0.3.1
+
+Maintenance and hardening release focused on stability and release hygiene.
+
+### Highlights
+- Removed panic-prone `unwrap`/`expect` code paths in key runtime flows.
+- Hardened GUI state handling to recover from poisoned mutexes.
+- Updated `Cargo.lock` to latest compatible dependency versions.
+- Added `.gitignore` for local build/benchmark/output artifacts.
+- Improved CI efficiency with concurrency cancellation and faster `cargo-audit` install.
+- Aligned crate version in `Cargo.toml` with release history.
+
+### Validation Executed
+- `cargo fmt --all -- --check`
+- `cargo test --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo audit`
+
+All checks passed.
+
 ## noer22 v0.3.0
 
 A feature release focused on practical backup workflows: keyfile auth, age public-key mode, incremental/delta mode, and passwordless checksum verification.
@@ -10,8 +30,14 @@ A feature release focused on practical backup workflows: keyfile auth, age publi
 - Added age recipient mode (`--age-recipient`) and identity-based decryption (`--age-identity`).
 - Desktop GUI now supports full auth parity (password/keyfile + age), checksum workflows,
   incremental index selection, and parallel-crypto toggle.
-- Added `noer22_bench` benchmark binary to compare noer22 against optional `7z` on the same dataset.
+- Added `noer22_bench` benchmark binary to compare noer22 against optional `7z`/`rar` on the same dataset.
+- Benchmark runner now supports multi-round statistics (`--rounds`, `--warmup-rounds`) and resource sampling (`--sample-ms`) with peak RAM/CPU metrics.
 - Updated `pack` default compression level to `8` (from `6`) based on mixed workload benchmark results.
+- Added strict security hardening:
+  - strict header validation (no implicit KDF fallback),
+  - bounded chunk-length checks,
+  - atomic archive writing and overwrite refusal,
+  - payload pre-authentication before extraction.
 - Added incremental/delta mode (`--incremental-index`) using BLAKE3 fingerprints.
 - Added incremental tombstones for removed files (applied during unpack).
 - Added external checksum generation (`--checksum sha256|blake3`) and verification.
@@ -56,6 +82,7 @@ noer22 verify backup.noer --checksum-file backup.noer.sha256
 - `cargo test`
 - `cargo test --all-features`
 - `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo audit`
 
 All checks passed.
 

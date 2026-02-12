@@ -74,6 +74,12 @@ pub fn write_sidecar(archive: &Path, algo: ChecksumAlgo, output: Option<&Path>) 
     let out_path = output
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| default_sidecar_path(archive, algo));
+    if out_path.exists() {
+        return Err(NoerError::InvalidFormat(format!(
+            "checksum output already exists: {}",
+            out_path.display()
+        )));
+    }
     let archive_name = archive
         .file_name()
         .map(|s| s.to_string_lossy().to_string())

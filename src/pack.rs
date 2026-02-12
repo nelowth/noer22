@@ -4,7 +4,10 @@ use crate::cli::{ChecksumChoice, CipherChoice, PackArgs};
 use crate::compression;
 use crate::crypto::{self, EncryptWriter};
 use crate::error::{NoerError, Result};
-use crate::format::{CompressionAlgo, CryptoAlgo, Header, HeaderFlags, KdfParams};
+use crate::format::{
+    CompressionAlgo, CryptoAlgo, Header, HeaderFlags, KdfParams, KDF_ITERS_MAX, KDF_ITERS_MIN,
+    KDF_MEM_MAX_MIB, KDF_MEM_MIN_MIB, KDF_PAR_MAX, KDF_PAR_MIN,
+};
 use crate::incremental::{self, FileProbe};
 use crate::metadata::{self, FileEntry, Metadata};
 use crate::utils::{self, ConcatReader, ProgressReader, RelPathSet};
@@ -26,6 +29,12 @@ pub fn pack(args: PackArgs) -> Result<()> {
     if args.inputs.is_empty() {
         return Err(NoerError::InvalidFormat("no input provided".into()));
     }
+    if args.output.exists() {
+        return Err(NoerError::InvalidFormat(format!(
+            "output already exists: {}",
+            args.output.display()
+        )));
+    }
     let use_age_recipients = !args.age_recipients.is_empty();
     if use_age_recipients && (args.password.is_some() || args.keyfile.is_some()) {
         return Err(NoerError::InvalidFormat(
@@ -40,10 +49,19 @@ pub fn pack(args: PackArgs) -> Result<()> {
     if args.level < -22 || args.level > 22 {
         return Err(NoerError::InvalidFormat("invalid compression level".into()));
     }
-    if args.kdf_mem == 0 || args.kdf_iters == 0 || args.kdf_parallelism == 0 {
-        return Err(NoerError::InvalidFormat(
-            "invalid Argon2id parameters".into(),
-        ));
+    if !(KDF_MEM_MIN_MIB..=KDF_MEM_MAX_MIB).contains(&args.kdf_mem)
+        || !(KDF_ITERS_MIN..=KDF_ITERS_MAX).contains(&args.kdf_iters)
+        || !(KDF_PAR_MIN..=KDF_PAR_MAX).contains(&args.kdf_parallelism)
+    {
+        return Err(NoerError::InvalidFormat(format!(
+            "invalid Argon2id parameters (mem={}..{} MiB, iters={}..{}, parallelism={}..{})",
+            KDF_MEM_MIN_MIB,
+            KDF_MEM_MAX_MIB,
+            KDF_ITERS_MIN,
+            KDF_ITERS_MAX,
+            KDF_PAR_MIN,
+            KDF_PAR_MAX
+        )));
     }
 
     let mut entries = collect_entries(&args.inputs)?;
@@ -155,7 +173,14 @@ pub fn pack(args: PackArgs) -> Result<()> {
     let mut encryptor =
         crypto::ChunkEncryptor::new(header.crypto, key.as_ref(), nonce, header_bytes.to_vec())?;
 
-    let out_file = File::create(&args.output)?;
+    let output_parent = args
+        .output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(output_parent)?;
+    let output_tmp = NamedTempFile::new_in(output_parent)?;
+    let out_file = output_tmp.reopen()?;
     let mut writer = BufWriter::new(out_file);
     writer.write_all(&header_bytes)?;
     if let Some(envelope) = wrapped_file_key.as_ref() {
@@ -189,10 +214,13 @@ pub fn pack(args: PackArgs) -> Result<()> {
         )?;
     } else {
         let encrypt_writer = EncryptWriter::new(writer, encryptor);
-        let mut writer =
-            write_payload_streaming(paths, total_size, encrypt_writer, args.level, threads)?;
-        writer.flush()?;
+        writer = write_payload_streaming(paths, total_size, encrypt_writer, args.level, threads)?;
     }
+    writer.flush()?;
+    drop(writer);
+    output_tmp
+        .persist(&args.output)
+        .map_err(|e| NoerError::Io(e.error))?;
 
     if let Some(algo) = args.checksum {
         let out =

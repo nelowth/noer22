@@ -6,6 +6,14 @@ pub const HEADER_SIZE: usize = 64;
 pub const FLAG_KEYFILE_REQUIRED: u8 = 1 << 0;
 pub const FLAG_INCREMENTAL_ARCHIVE: u8 = 1 << 1;
 pub const FLAG_AGE_RECIPIENTS: u8 = 1 << 2;
+pub const KNOWN_FLAGS_MASK: u8 =
+    FLAG_KEYFILE_REQUIRED | FLAG_INCREMENTAL_ARCHIVE | FLAG_AGE_RECIPIENTS;
+pub const KDF_MEM_MIN_MIB: u32 = 64;
+pub const KDF_MEM_MAX_MIB: u32 = 1024;
+pub const KDF_ITERS_MIN: u32 = 3;
+pub const KDF_ITERS_MAX: u32 = 12;
+pub const KDF_PAR_MIN: u32 = 1;
+pub const KDF_PAR_MAX: u32 = 64;
 
 #[derive(Debug, Clone, Copy)]
 pub enum CompressionAlgo {
@@ -28,8 +36,8 @@ pub struct KdfParams {
 impl Default for KdfParams {
     fn default() -> Self {
         Self {
-            mem_kib: 64 * 1024,
-            iterations: 3,
+            mem_kib: KDF_MEM_MIN_MIB * 1024,
+            iterations: KDF_ITERS_MIN,
             parallelism: 4,
         }
     }
@@ -100,7 +108,7 @@ impl Header {
         if &bytes[0..8] != MAGIC {
             return Err(NoerError::InvalidFormat("invalid magic".into()));
         }
-        let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+        let version = u16::from_le_bytes([bytes[8], bytes[9]]);
         if version != VERSION {
             return Err(NoerError::InvalidFormat(format!(
                 "unsupported version: {version}"
@@ -119,18 +127,40 @@ impl Header {
         salt.copy_from_slice(&bytes[12..28]);
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&bytes[28..40]);
-        let mem_kib = u32::from_le_bytes(bytes[40..44].try_into().unwrap());
-        let iterations = u32::from_le_bytes(bytes[44..48].try_into().unwrap());
-        let parallelism = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
+        let mem_kib = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
+        let iterations = u32::from_le_bytes([bytes[44], bytes[45], bytes[46], bytes[47]]);
+        let parallelism = u32::from_le_bytes([bytes[48], bytes[49], bytes[50], bytes[51]]);
         let flags_byte = bytes[52];
-        let kdf = if mem_kib == 0 || iterations == 0 || parallelism == 0 {
-            KdfParams::default()
-        } else {
-            KdfParams {
-                mem_kib,
-                iterations,
-                parallelism,
-            }
+        if flags_byte & !KNOWN_FLAGS_MASK != 0 {
+            return Err(NoerError::InvalidFormat("unknown header flags".into()));
+        }
+        if bytes[53..HEADER_SIZE].iter().any(|b| *b != 0) {
+            return Err(NoerError::InvalidFormat(
+                "non-zero reserved header bytes".into(),
+            ));
+        }
+        if mem_kib == 0 || iterations == 0 || parallelism == 0 {
+            return Err(NoerError::InvalidFormat("invalid kdf parameters".into()));
+        }
+        // Bound KDF values from untrusted headers to avoid excessive resource use.
+        if !mem_kib.is_multiple_of(1024) {
+            return Err(NoerError::InvalidFormat(
+                "kdf memory must be expressed in MiB".into(),
+            ));
+        }
+        let mem_mib = mem_kib / 1024;
+        if !(KDF_MEM_MIN_MIB..=KDF_MEM_MAX_MIB).contains(&mem_mib)
+            || !(KDF_ITERS_MIN..=KDF_ITERS_MAX).contains(&iterations)
+            || !(KDF_PAR_MIN..=KDF_PAR_MAX).contains(&parallelism)
+        {
+            return Err(NoerError::InvalidFormat(
+                "kdf parameters outside supported range".into(),
+            ));
+        }
+        let kdf = KdfParams {
+            mem_kib,
+            iterations,
+            parallelism,
         };
         let flags = HeaderFlags {
             keyfile_required: flags_byte & FLAG_KEYFILE_REQUIRED != 0,

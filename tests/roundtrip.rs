@@ -15,8 +15,8 @@ fn pack_args(root: &Path, inputs: Vec<PathBuf>, password: &str) -> PackArgs {
         age_recipients: Vec::new(),
         level: 3,
         cipher: CipherChoice::ChaCha20Poly1305,
-        kdf_mem: 32,
-        kdf_iters: 2,
+        kdf_mem: 64,
+        kdf_iters: 3,
         kdf_parallelism: 1,
         threads: Some(1),
         parallel_crypto: false,
@@ -249,8 +249,8 @@ fn keyfile_only_roundtrip_and_missing_keyfile_fails() {
         age_recipients: Vec::new(),
         level: 3,
         cipher: CipherChoice::ChaCha20Poly1305,
-        kdf_mem: 32,
-        kdf_iters: 2,
+        kdf_mem: 64,
+        kdf_iters: 3,
         kdf_parallelism: 1,
         threads: Some(1),
         parallel_crypto: false,
@@ -309,8 +309,8 @@ fn checksum_sidecar_allows_verify_without_password() {
         age_recipients: Vec::new(),
         level: 3,
         cipher: CipherChoice::ChaCha20Poly1305,
-        kdf_mem: 32,
-        kdf_iters: 2,
+        kdf_mem: 64,
+        kdf_iters: 3,
         kdf_parallelism: 1,
         threads: Some(1),
         parallel_crypto: false,
@@ -350,8 +350,8 @@ fn incremental_mode_packs_only_changed_files() {
         age_recipients: Vec::new(),
         level: 3,
         cipher: CipherChoice::ChaCha20Poly1305,
-        kdf_mem: 32,
-        kdf_iters: 2,
+        kdf_mem: 64,
+        kdf_iters: 3,
         kdf_parallelism: 1,
         threads: Some(1),
         parallel_crypto: false,
@@ -371,8 +371,8 @@ fn incremental_mode_packs_only_changed_files() {
         age_recipients: Vec::new(),
         level: 3,
         cipher: CipherChoice::ChaCha20Poly1305,
-        kdf_mem: 32,
-        kdf_iters: 2,
+        kdf_mem: 64,
+        kdf_iters: 3,
         kdf_parallelism: 1,
         threads: Some(1),
         parallel_crypto: false,
@@ -407,8 +407,8 @@ fn incremental_tombstone_deletes_removed_files_on_unpack() {
         age_recipients: Vec::new(),
         level: 3,
         cipher: CipherChoice::ChaCha20Poly1305,
-        kdf_mem: 32,
-        kdf_iters: 2,
+        kdf_mem: 64,
+        kdf_iters: 3,
         kdf_parallelism: 1,
         threads: Some(1),
         parallel_crypto: false,
@@ -439,8 +439,8 @@ fn incremental_tombstone_deletes_removed_files_on_unpack() {
         age_recipients: Vec::new(),
         level: 3,
         cipher: CipherChoice::ChaCha20Poly1305,
-        kdf_mem: 32,
-        kdf_iters: 2,
+        kdf_mem: 64,
+        kdf_iters: 3,
         kdf_parallelism: 1,
         threads: Some(1),
         parallel_crypto: false,
@@ -490,8 +490,8 @@ fn parallel_crypto_pack_roundtrip() {
         age_recipients: Vec::new(),
         level: 6,
         cipher: CipherChoice::ChaCha20Poly1305,
-        kdf_mem: 32,
-        kdf_iters: 2,
+        kdf_mem: 64,
+        kdf_iters: 3,
         kdf_parallelism: 1,
         threads: Some(4),
         parallel_crypto: true,
@@ -547,8 +547,8 @@ fn age_recipient_roundtrip() {
         age_recipients: vec![recipient],
         level: 3,
         cipher: CipherChoice::ChaCha20Poly1305,
-        kdf_mem: 32,
-        kdf_iters: 2,
+        kdf_mem: 64,
+        kdf_iters: 3,
         kdf_parallelism: 1,
         threads: Some(1),
         parallel_crypto: false,
@@ -583,4 +583,238 @@ fn age_recipient_roundtrip() {
         checksum_algo: None,
     })
     .unwrap();
+}
+
+#[test]
+fn pack_refuses_overwrite_existing_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/data.txt"), b"value").unwrap();
+    fs::write(root.join("archive.noer"), b"existing").unwrap();
+
+    let err = pack::pack(pack_args(root, vec![root.join("src")], "pass")).unwrap_err();
+    match err {
+        NoerError::InvalidFormat(msg) => assert!(msg.contains("output already exists")),
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn unpack_full_refuses_overwrite_conflicts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    fs::create_dir_all(root.join("data")).unwrap();
+    fs::write(root.join("data/file.txt"), b"archive-data").unwrap();
+    pack::pack(pack_args(root, vec![root.join("data")], "pass")).unwrap();
+
+    fs::create_dir_all(root.join("out/data")).unwrap();
+    fs::write(root.join("out/data/file.txt"), b"keep-me").unwrap();
+
+    let err = unpack::unpack(UnpackArgs {
+        archive: root.join("archive.noer"),
+        password: Some("pass".to_string()),
+        keyfile: None,
+        age_identities: Vec::new(),
+        output: Some(root.join("out")),
+        checksum_file: None,
+        checksum_algo: None,
+    })
+    .unwrap_err();
+
+    match err {
+        NoerError::InvalidFormat(msg) => assert!(msg.contains("refusing to overwrite")),
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(
+        fs::read(root.join("out/data/file.txt")).unwrap(),
+        b"keep-me"
+    );
+}
+
+#[test]
+fn tampered_and_truncated_archive_fail_safe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    fs::create_dir_all(root.join("data")).unwrap();
+    fs::write(root.join("data/secret.bin"), b"top-secret").unwrap();
+    pack::pack(pack_args(root, vec![root.join("data")], "pass")).unwrap();
+
+    let original = fs::read(root.join("archive.noer")).unwrap();
+
+    let mut tampered_header = original.clone();
+    tampered_header[0] ^= 0x80;
+    fs::write(root.join("tampered-header.noer"), &tampered_header).unwrap();
+
+    let err = unpack::verify(VerifyArgs {
+        archive: root.join("tampered-header.noer"),
+        password: Some("pass".to_string()),
+        keyfile: None,
+        age_identities: Vec::new(),
+        checksum_file: None,
+        checksum_algo: None,
+    })
+    .unwrap_err();
+    assert!(matches!(err, NoerError::InvalidFormat(_)));
+
+    let mut tampered_payload = original.clone();
+    let payload_idx = tampered_payload.len() / 2;
+    tampered_payload[payload_idx] ^= 0x33;
+    fs::write(root.join("tampered-payload.noer"), &tampered_payload).unwrap();
+
+    let err = unpack::verify(VerifyArgs {
+        archive: root.join("tampered-payload.noer"),
+        password: Some("pass".to_string()),
+        keyfile: None,
+        age_identities: Vec::new(),
+        checksum_file: None,
+        checksum_algo: None,
+    })
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        NoerError::AuthenticationFailed | NoerError::InvalidFormat(_)
+    ));
+
+    let out_corrupt = root.join("out_corrupt");
+    let err = unpack::unpack(UnpackArgs {
+        archive: root.join("tampered-payload.noer"),
+        password: Some("pass".to_string()),
+        keyfile: None,
+        age_identities: Vec::new(),
+        output: Some(out_corrupt.clone()),
+        checksum_file: None,
+        checksum_algo: None,
+    })
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        NoerError::AuthenticationFailed | NoerError::InvalidFormat(_)
+    ));
+    assert!(!out_corrupt.exists());
+
+    let truncated_len = original.len() / 3;
+    fs::write(
+        root.join("truncated.noer"),
+        &original[..truncated_len.max(1)],
+    )
+    .unwrap();
+
+    let out_trunc = root.join("out_trunc");
+    let err = unpack::unpack(UnpackArgs {
+        archive: root.join("truncated.noer"),
+        password: Some("pass".to_string()),
+        keyfile: None,
+        age_identities: Vec::new(),
+        output: Some(out_trunc.clone()),
+        checksum_file: None,
+        checksum_algo: None,
+    })
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        NoerError::AuthenticationFailed | NoerError::InvalidFormat(_)
+    ));
+    assert!(!out_trunc.exists());
+}
+
+#[test]
+fn fuzz_like_corruption_never_verifies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    fs::create_dir_all(root.join("data")).unwrap();
+    fs::write(root.join("data/blob.txt"), b"fuzz-target").unwrap();
+    pack::pack(pack_args(root, vec![root.join("data")], "pass")).unwrap();
+    let original = fs::read(root.join("archive.noer")).unwrap();
+
+    for i in 0usize..32 {
+        let mut mutated = original.clone();
+        let idx = 64 + ((i * 7919) % (mutated.len().saturating_sub(64).max(1)));
+        let mut delta = (i as u8).wrapping_mul(17).wrapping_add(1);
+        if delta == 0 {
+            delta = 0xA5;
+        }
+        mutated[idx] ^= delta;
+        let path = root.join(format!("mut_{i:02}.noer"));
+        fs::write(&path, mutated).unwrap();
+
+        let result = unpack::verify(VerifyArgs {
+            archive: path,
+            password: Some("pass".to_string()),
+            keyfile: None,
+            age_identities: Vec::new(),
+            checksum_file: None,
+            checksum_algo: None,
+        });
+        assert!(result.is_err(), "mutated archive unexpectedly verified");
+    }
+}
+
+#[test]
+fn weird_names_and_many_small_files_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let data = root.join("data");
+    fs::create_dir_all(&data).unwrap();
+
+    fs::write(data.join("space name.txt"), b"space").unwrap();
+    fs::write(data.join("symbols_#[]{}!.txt"), b"symbols").unwrap();
+    fs::write(data.join("unicode_arquivo_olA_\u{00FC}.txt"), b"unicode").unwrap();
+    fs::write(data.join("empty.bin"), b"").unwrap();
+
+    let deep = data
+        .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .join("cccccccccccccccccccccccccccccc");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("deep.txt"), b"deep").unwrap();
+
+    let small = data.join("small");
+    fs::create_dir_all(&small).unwrap();
+    for i in 0..1200usize {
+        fs::write(small.join(format!("f_{i:04}.txt")), format!("v{i}")).unwrap();
+    }
+
+    pack::pack(pack_args(root, vec![data.clone()], "pass")).unwrap();
+    unpack::unpack(UnpackArgs {
+        archive: root.join("archive.noer"),
+        password: Some("pass".to_string()),
+        keyfile: None,
+        age_identities: Vec::new(),
+        output: Some(root.join("out")),
+        checksum_file: None,
+        checksum_algo: None,
+    })
+    .unwrap();
+
+    assert_eq!(
+        fs::read(root.join("out/data/space name.txt")).unwrap(),
+        b"space".as_slice()
+    );
+    assert_eq!(
+        fs::read(root.join("out/data/symbols_#[]{}!.txt")).unwrap(),
+        b"symbols".as_slice()
+    );
+    assert_eq!(
+        fs::read(root.join("out/data/unicode_arquivo_olA_\u{00FC}.txt")).unwrap(),
+        b"unicode".as_slice()
+    );
+    assert_eq!(fs::read(root.join("out/data/empty.bin")).unwrap().len(), 0);
+    assert_eq!(
+        fs::read(
+            root.join(
+                "out/data/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccccccccccccc/deep.txt",
+            ),
+        )
+        .unwrap(),
+        b"deep".as_slice()
+    );
+    assert_eq!(
+        fs::read(root.join("out/data/small/f_0999.txt")).unwrap(),
+        b"v999".as_slice()
+    );
 }

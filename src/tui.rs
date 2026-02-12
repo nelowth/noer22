@@ -200,11 +200,13 @@ impl App {
                     self.run_with_suspend(terminal, || pack::pack(args), "Pack completed")?;
                 }
             }
-            _ => edit_text_field(
-                key,
-                self.pack_text_mut(self.cursor)
-                    .expect("invalid pack field index"),
-            ),
+            _ => {
+                if let Some(field) = self.pack_text_mut(self.cursor) {
+                    edit_text_field(key, field);
+                } else {
+                    self.status = format!("Internal UI error: invalid pack field {}", self.cursor);
+                }
+            }
         }
         Ok(())
     }
@@ -228,11 +230,14 @@ impl App {
                     self.run_with_suspend(terminal, || unpack::unpack(args), "Unpack completed")?;
                 }
             }
-            _ => edit_text_field(
-                key,
-                self.unpack_text_mut(self.cursor)
-                    .expect("invalid unpack field index"),
-            ),
+            _ => {
+                if let Some(field) = self.unpack_text_mut(self.cursor) {
+                    edit_text_field(key, field);
+                } else {
+                    self.status =
+                        format!("Internal UI error: invalid unpack field {}", self.cursor);
+                }
+            }
         }
         Ok(())
     }
@@ -256,11 +261,13 @@ impl App {
                     self.run_with_suspend(terminal, || unpack::list(args), "List completed")?;
                 }
             }
-            _ => edit_text_field(
-                key,
-                self.list_text_mut(self.cursor)
-                    .expect("invalid list field index"),
-            ),
+            _ => {
+                if let Some(field) = self.list_text_mut(self.cursor) {
+                    edit_text_field(key, field);
+                } else {
+                    self.status = format!("Internal UI error: invalid list field {}", self.cursor);
+                }
+            }
         }
         Ok(())
     }
@@ -284,11 +291,14 @@ impl App {
                     self.run_with_suspend(terminal, || unpack::verify(args), "Verify completed")?;
                 }
             }
-            _ => edit_text_field(
-                key,
-                self.verify_text_mut(self.cursor)
-                    .expect("invalid verify field index"),
-            ),
+            _ => {
+                if let Some(field) = self.verify_text_mut(self.cursor) {
+                    edit_text_field(key, field);
+                } else {
+                    self.status =
+                        format!("Internal UI error: invalid verify field {}", self.cursor);
+                }
+            }
         }
         Ok(())
     }

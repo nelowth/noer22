@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.1] - 2026-02-12
+
+### Changed
+- Updated dependency lockfile (`Cargo.lock`) to latest compatible crate versions (`cargo update`).
+- Aligned crate version in `Cargo.toml` with release history (`0.3.1`).
+- Added repository `.gitignore` for build, benchmark, and local archive/checksum artifacts.
+- CI now uses workflow concurrency cancellation to reduce duplicate runs.
+- CI audit job now installs `cargo-audit` via `taiki-e/install-action` for faster setup.
+
+### Fixed
+- Removed panic-prone `unwrap`/`expect` paths from production code in header parsing, TUI field editing, and GUI shared-state locking.
+- GUI status and archive inspection state now recover safely from poisoned mutexes instead of panicking.
+- Progress bar style setup now falls back safely when template parsing fails.
+
 ## [0.3.0] - 2026-02-11
 
 ### Added
@@ -31,13 +45,20 @@ All notable changes to this project are documented in this file.
 - GUI now exposes checksum-sidecar workflows (pack sidecar output, extract pre-check, verify checksum-only mode).
 - GUI Pack now exposes incremental index and experimental `parallel-crypto` toggles.
 - GUI now validates dropped `.noer` files, deduplicates dropped inputs, and suggests OS-friendly default output paths.
-- Added `noer22_bench` binary for reproducible benchmark runs (noer22 + optional 7z comparison).
+- Added `noer22_bench` binary for reproducible benchmark runs (noer22 + optional 7z/rar comparison).
+- `noer22_bench` now supports multi-round benchmarking and reports mean/stddev plus peak RAM/CPU for pack/extract.
+- Header validation is now strict: rejects unknown flags, non-zero reserved bytes, invalid/implicit KDF values.
+- Archive chunk decoder now enforces safe maximum chunk size bounds.
+- `pack` now uses atomic output writes and refuses silent overwrite of existing output files.
+- `unpack` now performs full payload pre-authentication before extraction and uses per-file temp+persist writes.
+- Full restore mode now refuses silent overwrite conflicts in output paths.
 
 ### Security
 - Key derivation now supports combined key material from password and keyfile.
 - Added age-wrapped file-key envelope for recipient-based archives.
 - Archives marked as keyfile-protected now fail early when keyfile is missing.
 - Sidecar verification supports explicit algorithm matching to prevent confusion/mismatch.
+- Added `SECURITY.md` documenting cryptographic design decisions and safety guarantees.
 
 ### Performance
 - Incremental hashing pipeline is parallelized with Rayon.

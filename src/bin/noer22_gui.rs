@@ -198,7 +198,7 @@ impl eframe::App for GuiApp {
         self.apply_theme(ctx);
         self.handle_drops(ctx);
 
-        let status = self.status.lock().unwrap().clone();
+        let status = lock_unpoison(self.status.as_ref()).clone();
         if status.kind != self.last_status_kind {
             if status.kind == StatusKind::Error {
                 self.error_flash = Some(Instant::now());
@@ -216,7 +216,7 @@ impl eframe::App for GuiApp {
         ctx.request_repaint_after(Duration::from_millis(if animate { 33 } else { 120 }));
 
         let margin = 16.0;
-        let rect = ctx.screen_rect();
+        let rect = ctx.content_rect();
         let pos = rect.min + egui::vec2(margin, margin);
         let size = rect.size() - egui::vec2(margin * 2.0, margin * 2.0);
 
@@ -228,10 +228,10 @@ impl eframe::App for GuiApp {
                 ui.set_min_size(size);
                 ui.set_max_width(size.x);
                 ui.set_max_height(size.y);
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(rgba(6, 8, 14, 235))
-                    .rounding(egui::Rounding::same(14.0))
-                    .inner_margin(egui::Margin::same(16.0))
+                    .corner_radius(egui::CornerRadius::same(14))
+                    .inner_margin(egui::Margin::same(16))
                     .stroke(egui::Stroke::new(1.2, rgb(191, 164, 111)))
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical()
@@ -272,8 +272,9 @@ impl GuiApp {
         let glow_rect = rect.shrink(6.0);
         painter.rect_stroke(
             glow_rect,
-            10.0,
+            egui::CornerRadius::same(10),
             egui::Stroke::new(1.0, rgba(212, 175, 55, 40)),
+            egui::StrokeKind::Inside,
         );
 
         let icon_rect =
@@ -316,7 +317,7 @@ impl GuiApp {
 
     fn metrics_row(&self, ui: &mut egui::Ui) {
         let accent = rgb(212, 175, 55);
-        let inspection = self.inspect_result.lock().unwrap().clone();
+        let inspection = lock_unpoison(self.inspect_result.as_ref()).clone();
         ui.horizontal(|ui| match self.mode {
             Mode::Pack => {
                 metric_card(ui, "Input", &human_bytes(self.total_input), accent);
@@ -381,8 +382,9 @@ impl GuiApp {
             drop_painter.rect_filled(drop_rect, 8.0, rgba(12, 14, 22, 180));
             drop_painter.rect_stroke(
                 drop_rect,
-                8.0,
+                egui::CornerRadius::same(8),
                 egui::Stroke::new(1.0, rgba(212, 175, 55, 80)),
+                egui::StrokeKind::Inside,
             );
             drop_painter.text(
                 drop_rect.center(),
@@ -885,7 +887,7 @@ impl GuiApp {
             self.run_list();
         }
 
-        if let Some(info) = self.inspect_result.lock().unwrap().clone() {
+        if let Some(info) = lock_unpoison(self.inspect_result.as_ref()).clone() {
             card(ui, "Archive Index", |ui| {
                 ui.label(format!(
                     "{} entries ({} files, {} directories) | payload {}",
@@ -1325,15 +1327,15 @@ impl GuiApp {
             .and_then(|p| fs::metadata(p).ok())
             .map(|m| m.len())
             .unwrap_or(0);
-        *self.inspect_result.lock().unwrap() = None;
+        *lock_unpoison(self.inspect_result.as_ref()) = None;
     }
 
     fn apply_preset(&mut self, preset: Preset) {
         match preset {
             Preset::Fast => {
                 self.level = 3;
-                self.kdf_mem = 32;
-                self.kdf_iters = 2;
+                self.kdf_mem = 64;
+                self.kdf_iters = 3;
                 self.kdf_parallelism = 2;
             }
             Preset::Balanced => {
@@ -1585,7 +1587,7 @@ impl GuiApp {
         let inspect_result = self.inspect_result.clone();
         self.job_started = Some(Instant::now());
         running.store(true, Ordering::Relaxed);
-        *inspect_result.lock().unwrap() = None;
+        *lock_unpoison(inspect_result.as_ref()) = None;
         set_status(&status, StatusKind::Running, "Inspecting archive...");
 
         thread::spawn(move || {
@@ -1609,7 +1611,7 @@ impl GuiApp {
 
             match result {
                 Ok(Ok(info)) => {
-                    *inspect_result.lock().unwrap() = Some(info);
+                    *lock_unpoison(inspect_result.as_ref()) = Some(info);
                     set_status(
                         &status,
                         StatusKind::Success,
@@ -1726,9 +1728,9 @@ impl GuiApp {
             stroke: egui::Stroke::new(1.5, rgb(212, 175, 55)),
         };
         style.visuals.window_shadow = Shadow {
-            offset: egui::vec2(0.0, 6.0),
-            blur: 24.0,
-            spread: 0.0,
+            offset: [0, 6],
+            blur: 24,
+            spread: 0,
             color: rgba(0, 0, 0, 180),
         };
         style.spacing.item_spacing = egui::vec2(10.0, 10.0);
@@ -1744,7 +1746,7 @@ impl GuiApp {
 
     fn paint_background(&self, ctx: &egui::Context, status: StatusKind) {
         use egui::{Color32, Id, LayerId, Order, Pos2, Shape, Stroke};
-        let rect = ctx.screen_rect();
+        let rect = ctx.content_rect();
         let painter = ctx.layer_painter(LayerId::new(Order::Background, Id::new("bg")));
 
         painter.rect_filled(rect, 0.0, rgb(10, 10, 10));
@@ -1809,8 +1811,9 @@ impl GuiApp {
         let border = rect.shrink(6.0);
         painter.add(Shape::rect_stroke(
             border,
-            8.0,
+            egui::CornerRadius::same(8),
             Stroke::new(1.1, rgb(191, 164, 111)),
+            egui::StrokeKind::Inside,
         ));
 
         paint_corner_ornaments(&painter, border, rgb(191, 164, 111));
@@ -1857,11 +1860,11 @@ enum Preset {
 }
 
 fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    let frame = egui::Frame::none()
+    let frame = egui::Frame::new()
         .fill(rgb(14, 16, 26))
         .stroke(egui::Stroke::new(1.0, rgb(191, 164, 111)))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(12.0));
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(12));
     frame.show(ui, |ui| {
         ui.label(egui::RichText::new(title).strong().color(rgb(212, 175, 55)));
         ui.add_space(4.0);
@@ -1871,11 +1874,11 @@ fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 fn metric_card(ui: &mut egui::Ui, label: &str, value: &str, accent: egui::Color32) {
-    let frame = egui::Frame::none()
+    let frame = egui::Frame::new()
         .fill(rgba(18, 20, 32, 200))
         .stroke(egui::Stroke::new(1.0, rgba(212, 175, 55, 60)))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(10.0, 8.0));
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(10, 8));
     frame.show(ui, |ui| {
         ui.label(egui::RichText::new(label).color(rgb(191, 164, 111)));
         ui.label(egui::RichText::new(value).strong().color(accent));
@@ -1896,18 +1899,25 @@ fn gold_button(text: &str) -> egui::Button<'_> {
     egui::Button::new(egui::RichText::new(text).color(rgb(20, 16, 10)))
         .fill(rgb(212, 175, 55))
         .stroke(egui::Stroke::new(1.0, rgb(191, 164, 111)))
-        .rounding(6.0)
+        .corner_radius(egui::CornerRadius::same(6))
 }
 
 fn dark_button(text: &str) -> egui::Button<'_> {
     egui::Button::new(egui::RichText::new(text).color(rgb(209, 213, 219)))
         .fill(rgba(18, 20, 32, 180))
         .stroke(egui::Stroke::new(1.0, rgba(212, 175, 55, 60)))
-        .rounding(6.0)
+        .corner_radius(egui::CornerRadius::same(6))
+}
+
+fn lock_unpoison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 fn set_status(state: &Arc<Mutex<StatusState>>, kind: StatusKind, msg: &str) {
-    let mut guard = state.lock().unwrap();
+    let mut guard = lock_unpoison(state.as_ref());
     guard.message = msg.to_string();
     guard.kind = kind;
 }
@@ -2189,8 +2199,9 @@ fn paint_vault_icon(painter: &egui::Painter, rect: egui::Rect) {
     );
     painter.rect_stroke(
         shackle_rect,
-        egui::Rounding::same(radius * 0.5),
+        egui::CornerRadius::same((radius * 0.5).round().clamp(0.0, 255.0) as u8),
         egui::Stroke::new(2.0, rgb(191, 164, 111)),
+        egui::StrokeKind::Inside,
     );
 
     painter.circle_filled(center, radius * 0.18, rgba(4, 4, 6, 200));

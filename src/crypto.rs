@@ -9,6 +9,8 @@ use zeroize::Zeroizing;
 
 pub const TAG_LEN: usize = 16;
 pub const CHUNK_SIZE: usize = 64 * 1024;
+pub const MAX_CHUNK_TOTAL_LEN: usize = 256 * 1024 * 1024;
+pub const MAX_CHUNK_PLAINTEXT_LEN: usize = MAX_CHUNK_TOTAL_LEN - TAG_LEN;
 pub const AUTH_ERROR_TAG: &str = "NOER22_AUTH_FAILED";
 
 pub fn random_salt() -> Result<[u8; 16]> {
@@ -96,6 +98,9 @@ pub fn encrypt_chunk_at_index(
     chunk_index: usize,
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
+    if plaintext.len() > MAX_CHUNK_PLAINTEXT_LEN {
+        return Err(NoerError::InvalidFormat("chunk too large".into()));
+    }
     let nonce = nonce_for_index(nonce_base, chunk_index)?;
     let unbound = UnboundKey::new(algo_to_ring(algo)?, key_bytes)
         .map_err(|_| NoerError::InvalidFormat("chave invalida".into()))?;
@@ -107,8 +112,8 @@ pub fn encrypt_chunk_at_index(
         .map_err(|_| NoerError::InvalidFormat("encryption failed".into()))?;
 
     let total_len = ciphertext.len() + TAG_LEN;
-    if total_len > u32::MAX as usize {
-        return Err(NoerError::InvalidFormat("chunk grande demais".into()));
+    if total_len > u32::MAX as usize || total_len > MAX_CHUNK_TOTAL_LEN {
+        return Err(NoerError::InvalidFormat("chunk too large".into()));
     }
 
     let mut encoded = Vec::with_capacity(4 + total_len);
@@ -197,14 +202,17 @@ impl ChunkEncryptor {
         plaintext: &mut [u8],
         writer: &mut W,
     ) -> Result<()> {
+        if plaintext.len() > MAX_CHUNK_PLAINTEXT_LEN {
+            return Err(NoerError::InvalidFormat("chunk too large".into()));
+        }
         let nonce = self.nonce.next()?;
         let tag = self
             .key
             .seal_in_place_separate_tag(nonce, Aad::from(&self.aad), plaintext)
             .map_err(|_| NoerError::InvalidFormat("encryption failed".into()))?;
         let total_len = plaintext.len() + TAG_LEN;
-        if total_len > u32::MAX as usize {
-            return Err(NoerError::InvalidFormat("chunk grande demais".into()));
+        if total_len > u32::MAX as usize || total_len > MAX_CHUNK_TOTAL_LEN {
+            return Err(NoerError::InvalidFormat("chunk too large".into()));
         }
         writer.write_all(&(total_len as u32).to_le_bytes())?;
         writer.write_all(plaintext)?;
@@ -245,8 +253,19 @@ impl ChunkDecryptor {
         if total_len < TAG_LEN {
             return Err(NoerError::InvalidFormat("invalid chunk".into()));
         }
+        if total_len > MAX_CHUNK_TOTAL_LEN {
+            return Err(NoerError::InvalidFormat(
+                "chunk length exceeds safe limit".into(),
+            ));
+        }
         let mut buf = vec![0u8; total_len];
-        reader.read_exact(&mut buf)?;
+        reader.read_exact(&mut buf).map_err(|err| {
+            if err.kind() == io::ErrorKind::UnexpectedEof {
+                NoerError::InvalidFormat("truncated archive".into())
+            } else {
+                NoerError::Io(err)
+            }
+        })?;
         let ct_len = total_len - TAG_LEN;
         let (ciphertext, tag_bytes) = buf.split_at_mut(ct_len);
         let tag: aead::Tag = (&*tag_bytes)

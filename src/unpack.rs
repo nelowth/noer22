@@ -9,6 +9,7 @@ use crate::utils;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
 const MAX_AGE_ENVELOPE_LEN: usize = 1024 * 1024;
@@ -41,6 +42,14 @@ pub fn unpack(args: UnpackArgs) -> Result<()> {
         println!("External checksum OK ({})", result.algo.id());
     }
 
+    // Pre-authenticate all encrypted chunks before touching output files.
+    verify_archive_payload(
+        &args.archive,
+        args.password.as_deref(),
+        args.keyfile.as_deref(),
+        &args.age_identities,
+    )?;
+
     let opened = open_archive(
         &args.archive,
         args.password.as_deref(),
@@ -53,6 +62,11 @@ pub fn unpack(args: UnpackArgs) -> Result<()> {
         None => std::env::current_dir()?,
     };
     std::fs::create_dir_all(&out_dir)?;
+    let allow_overwrite = opened.header.flags.incremental;
+    let overwrite_count = preflight_output_conflicts(&out_dir, &opened.metadata, allow_overwrite)?;
+    if allow_overwrite && overwrite_count > 0 {
+        println!("Incremental restore will update/remove {overwrite_count} existing path(s)");
+    }
 
     let total_size: u64 = opened
         .metadata
@@ -68,52 +82,76 @@ pub fn unpack(args: UnpackArgs) -> Result<()> {
         .map_err(|e| NoerError::InvalidFormat(e.to_string()))?;
     let _ = decoder.window_log_max(31);
 
-    for entry in opened.metadata.files {
-        let rel = utils::sanitize_rel_path(&entry.path)?;
-        let out_path: PathBuf = out_dir.join(rel);
-        if entry.deleted {
-            remove_existing_path(&out_path)?;
-            continue;
-        }
-        if entry.is_dir {
-            ensure_directory_path(&out_path)?;
-            std::fs::create_dir_all(&out_path)?;
+    let mut completed_entries = 0usize;
+    let extract_result: Result<()> = (|| {
+        for entry in opened.metadata.files {
+            let rel = utils::sanitize_rel_path(&entry.path)?;
+            let out_path: PathBuf = out_dir.join(rel);
+            if entry.deleted {
+                remove_existing_path(&out_path)?;
+                completed_entries += 1;
+                continue;
+            }
+            if entry.is_dir {
+                ensure_directory_path(&out_path)?;
+                std::fs::create_dir_all(&out_path)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(entry.mode);
+                    let _ = std::fs::set_permissions(&out_path, perms);
+                }
+                completed_entries += 1;
+                continue;
+            }
+
+            let parent = out_path
+                .parent()
+                .ok_or_else(|| NoerError::InvalidFormat("invalid output path".into()))?;
+            ensure_directory_path(parent)?;
+            std::fs::create_dir_all(parent)?;
+            if out_path.is_dir() {
+                std::fs::remove_dir_all(&out_path)?;
+            }
+
+            let mut temp_file = NamedTempFile::new_in(parent)?;
+            if let Err(err) =
+                utils::copy_exact(&mut decoder, temp_file.as_file_mut(), entry.size, &pb)
+            {
+                if is_auth_error(&err) {
+                    return Err(NoerError::AuthenticationFailed);
+                }
+                return Err(NoerError::Io(err));
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let perms = std::fs::Permissions::from_mode(entry.mode);
-                let _ = std::fs::set_permissions(&out_path, perms);
+                let _ = std::fs::set_permissions(temp_file.path(), perms);
             }
-            continue;
-        }
 
-        if let Some(parent) = out_path.parent() {
-            ensure_directory_path(parent)?;
-            std::fs::create_dir_all(parent)?;
-        }
-        if out_path.is_dir() {
-            std::fs::remove_dir_all(&out_path)?;
-        }
-        let mut out_file = File::create(&out_path)?;
-        if let Err(err) = utils::copy_exact(&mut decoder, &mut out_file, entry.size, &pb) {
-            if is_auth_error(&err) {
-                return Err(NoerError::AuthenticationFailed);
+            if allow_overwrite && out_path.exists() {
+                remove_existing_path(&out_path)?;
             }
-            return Err(NoerError::Io(err));
+
+            temp_file
+                .persist(&out_path)
+                .map_err(|e| NoerError::Io(e.error))?;
+            completed_entries += 1;
         }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(entry.mode);
-            let _ = std::fs::set_permissions(&out_path, perms);
-        }
-    }
-
-    ensure_decoder_drained(&mut decoder)?;
+        ensure_decoder_drained(&mut decoder)?;
+        Ok(())
+    })();
 
     pb.finish_and_clear();
-    Ok(())
+    match extract_result {
+        Ok(()) => Ok(()),
+        Err(NoerError::AuthenticationFailed) => Err(NoerError::AuthenticationFailed),
+        Err(err) => Err(NoerError::InvalidFormat(format!(
+            "extraction aborted after {completed_entries} entries; output may be partial: {err}"
+        ))),
+    }
 }
 
 pub fn inspect_archive(path: &Path, password: &str) -> Result<ArchiveOverview> {
@@ -266,10 +304,7 @@ fn verify_archive_payload(
             continue;
         }
         if let Err(err) = utils::copy_exact(&mut decoder, &mut sink, entry.size, &pb) {
-            if is_auth_error(&err) {
-                return Err(NoerError::AuthenticationFailed);
-            }
-            return Err(NoerError::Io(err));
+            return Err(map_archive_io(err));
         }
     }
 
@@ -296,7 +331,9 @@ fn open_archive(
     let mut reader = BufReader::new(input);
 
     let mut header_bytes = [0u8; HEADER_SIZE];
-    reader.read_exact(&mut header_bytes)?;
+    reader
+        .read_exact(&mut header_bytes)
+        .map_err(map_archive_io)?;
     let header = Header::from_bytes(header_bytes)?;
 
     let key = if header.flags.age_recipients {
@@ -343,7 +380,7 @@ fn open_archive(
 
 fn read_age_envelope<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf)?;
+    reader.read_exact(&mut len_buf).map_err(map_archive_io)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len == 0 || len > MAX_AGE_ENVELOPE_LEN {
         return Err(NoerError::InvalidFormat(
@@ -351,7 +388,7 @@ fn read_age_envelope<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
         ));
     }
     let mut envelope = vec![0u8; len];
-    reader.read_exact(&mut envelope)?;
+    reader.read_exact(&mut envelope).map_err(map_archive_io)?;
     Ok(envelope)
 }
 
@@ -418,6 +455,17 @@ fn is_auth_error(err: &std::io::Error) -> bool {
         && err.to_string().contains(crypto::AUTH_ERROR_TAG)
 }
 
+fn map_archive_io(err: std::io::Error) -> NoerError {
+    if is_auth_error(&err) {
+        return NoerError::AuthenticationFailed;
+    }
+    match err.kind() {
+        std::io::ErrorKind::UnexpectedEof => NoerError::InvalidFormat("truncated archive".into()),
+        std::io::ErrorKind::InvalidData => NoerError::InvalidFormat(err.to_string()),
+        _ => NoerError::Io(err),
+    }
+}
+
 fn crypto_name(crypto: CryptoAlgo) -> &'static str {
     match crypto {
         CryptoAlgo::ChaCha20Poly1305 => "ChaCha20-Poly1305",
@@ -458,4 +506,39 @@ fn ensure_directory_path(path: &Path) -> Result<()> {
         remove_existing_path(path)?;
     }
     Ok(())
+}
+
+fn preflight_output_conflicts(
+    out_dir: &Path,
+    metadata: &Metadata,
+    allow_overwrite: bool,
+) -> Result<usize> {
+    let mut conflicts = 0usize;
+    for entry in &metadata.files {
+        let rel = utils::sanitize_rel_path(&entry.path)?;
+        let out_path = out_dir.join(rel);
+        if entry.deleted {
+            if out_path.exists() {
+                conflicts += 1;
+            }
+            continue;
+        }
+        if entry.is_dir {
+            if out_path.exists() && !out_path.is_dir() {
+                conflicts += 1;
+            }
+            continue;
+        }
+        if out_path.exists() {
+            conflicts += 1;
+        }
+    }
+
+    if !allow_overwrite && conflicts > 0 {
+        return Err(NoerError::InvalidFormat(format!(
+            "refusing to overwrite {conflicts} existing path(s) during full restore; choose an empty output directory"
+        )));
+    }
+
+    Ok(conflicts)
 }

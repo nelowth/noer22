@@ -10,6 +10,7 @@ All notable changes to this project are documented in this file.
 - Added repository `.gitignore` for build, benchmark, and local archive/checksum artifacts.
 - CI now uses workflow concurrency cancellation to reduce duplicate runs.
 - CI audit job now installs `cargo-audit` via `taiki-e/install-action` for faster setup.
+- Refreshed project documentation (`README.md`, `SECURITY.md`, `BENCHMARK.md`, screenshot guide).
 
 ### Fixed
 - Removed panic-prone `unwrap`/`expect` paths from production code in header parsing, TUI field editing, and GUI shared-state locking.
@@ -31,44 +32,37 @@ All notable changes to this project are documented in this file.
 - New modules: `checksum` and `incremental`.
 
 ### Changed
-- Archive header now stores feature flags (`keyfile_required`, `incremental_archive`).
 - Archive header now stores feature flags (`keyfile_required`, `incremental_archive`, `age_recipients`).
 - `list` output now reports auth mode and archive mode (full/incremental).
 - `list` output now includes deletion entries (`[DEL]`) for incremental archives.
 - CLI auth model updated from password-only to password-or-keyfile where applicable.
 - Added `--parallel-crypto` experimental deterministic parallel chunk encryption path.
-- `pack` default compression level updated from `6` to `8` (better speed/ratio balance in measured mixed dataset).
-- GUI now supports both auth families end-to-end:
-  - password/keyfile and keyfile-only,
-  - age recipients in Pack,
-  - age identity files in Extract/List/Verify.
-- GUI now exposes checksum-sidecar workflows (pack sidecar output, extract pre-check, verify checksum-only mode).
-- GUI Pack now exposes incremental index and experimental `parallel-crypto` toggles.
-- GUI now validates dropped `.noer` files, deduplicates dropped inputs, and suggests OS-friendly default output paths.
-- Added `noer22_bench` binary for reproducible benchmark runs (noer22 + optional 7z/rar comparison).
-- `noer22_bench` now supports multi-round benchmarking and reports mean/stddev plus peak RAM/CPU for pack/extract.
-- Header validation is now strict: rejects unknown flags, non-zero reserved bytes, invalid/implicit KDF values.
-- Archive chunk decoder now enforces safe maximum chunk size bounds.
-- `pack` now uses atomic output writes and refuses silent overwrite of existing output files.
-- `unpack` now performs full payload pre-authentication before extraction and uses per-file temp+persist writes.
-- Full restore mode now refuses silent overwrite conflicts in output paths.
+- `pack` default compression level updated from `6` to `8`.
+- GUI now supports both auth families end-to-end (password/keyfile and age).
+- GUI now exposes checksum-sidecar workflows and incremental/parallel controls.
+- Added `noer22_bench` binary for reproducible benchmark runs.
+- Benchmark runner now supports multi-round stats + peak RAM/CPU sampling.
+- Header validation is strict: rejects unknown flags, non-zero reserved bytes, invalid/implicit KDF values.
+- Archive decoder now enforces safe maximum chunk size bounds.
+- `pack` uses atomic output writes and refuses silent overwrite.
+- `unpack` performs full payload pre-authentication before extraction and uses temp+persist writes.
+- Full restore mode refuses silent overwrite conflicts.
 
 ### Security
-- Key derivation now supports combined key material from password and keyfile.
+- Key derivation supports combined password and keyfile material.
 - Added age-wrapped file-key envelope for recipient-based archives.
-- Archives marked as keyfile-protected now fail early when keyfile is missing.
-- Sidecar verification supports explicit algorithm matching to prevent confusion/mismatch.
-- Added `SECURITY.md` documenting cryptographic design decisions and safety guarantees.
+- Keyfile-protected archives fail early when keyfile is missing.
+- Sidecar verification supports explicit algorithm matching.
+- Added `SECURITY.md` with cryptographic and safety notes.
 
 ### Performance
 - Incremental hashing pipeline is parallelized with Rayon.
-- Existing multi-threaded zstd path remains available via `--threads`.
+- Multi-threaded zstd path remains available via `--threads`.
 
 ### Tests
-- Added integration coverage for:
-  - keyfile-only roundtrip and missing-keyfile failure,
-  - checksum-sidecar verify without password,
-  - incremental mode packing only changed files.
+- Added integration coverage for keyfile-only roundtrip and missing-keyfile failure.
+- Added checksum-sidecar verify without password coverage.
+- Added incremental mode changed-files-only coverage.
 
 ## [0.2.0] - 2026-02-11
 
@@ -76,7 +70,7 @@ All notable changes to this project are documented in this file.
 - New CLI command `list` to inspect `.noer` contents without extraction.
 - New CLI command `verify` to validate password and full archive integrity.
 - New GUI modes: `List` and `Verify`.
-- In-app archive index view in GUI list mode (entries, counts, payload size, crypto/KDF summary).
+- In-app archive index view in GUI list mode.
 - New backend API `inspect_archive()` returning structured archive overview.
 
 ### Changed
@@ -95,16 +89,11 @@ All notable changes to this project are documented in this file.
 - Streamlined chunk encryption/decryption buffer reuse.
 
 ### Security
-- Hardened archive metadata path checks using conflict-aware relative path validation.
+- Hardened archive metadata path checks with conflict-aware relative path validation.
 - Improved error handling for malformed/truncated archives and auth failures.
 
 ### Tests
-- Added/updated integration coverage for:
-  - roundtrip pack/unpack,
-  - wrong-password failures,
-  - `list` and `verify` flows,
-  - empty root directory preservation.
-
-### Docs
-- Added release-ready notes in `RELEASE_NOTES.md`.
-- Added showcase guidance and screenshot template section in `README.md`.
+- Added/updated integration coverage for roundtrip pack/unpack.
+- Added wrong-password failure coverage.
+- Added `list` and `verify` flow coverage.
+- Added empty root directory preservation coverage.

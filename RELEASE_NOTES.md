@@ -1,72 +1,54 @@
 # Release Notes (GitHub-ready)
 
-## noer22 v0.3.1
+## noer22 v0.3.1 (2026-02-12)
 
-Maintenance and hardening release focused on stability and release hygiene.
+Maintenance and hardening release focused on reliability, documentation quality, and release hygiene.
 
 ### Highlights
-- Removed panic-prone `unwrap`/`expect` code paths in key runtime flows.
-- Hardened GUI state handling to recover from poisoned mutexes.
+
+- Removed panic-prone `unwrap`/`expect` paths from production runtime flows.
+- Hardened GUI shared state handling against poisoned mutexes.
 - Updated `Cargo.lock` to latest compatible dependency versions.
-- Added `.gitignore` for local build/benchmark/output artifacts.
-- Improved CI efficiency with concurrency cancellation and faster `cargo-audit` install.
-- Aligned crate version in `Cargo.toml` with release history.
+- Added `.gitignore` for build, benchmark, and local archive/checksum outputs.
+- Improved CI efficiency:
+  - workflow concurrency cancellation
+  - `cargo-audit` install via `taiki-e/install-action`
+- Performed complete documentation refresh (`README`, `SECURITY`, `BENCHMARK`, screenshot guide).
+- Aligned crate version and release docs to `0.3.1`.
 
 ### Validation Executed
+
 - `cargo fmt --all -- --check`
-- `cargo test --all-features`
 - `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-features`
 - `cargo audit`
 
 All checks passed.
 
 ## noer22 v0.3.0
 
-A feature release focused on practical backup workflows: keyfile auth, age public-key mode, incremental/delta mode, and passwordless checksum verification.
+Feature release focused on practical backup workflows: keyfile auth, age public-key mode, incremental/delta mode, and checksum-driven verification.
 
 ### Highlights
-- Added keyfile support (`--keyfile`) for pack/unpack/list/verify.
-- Added hybrid auth (`password + keyfile`) and keyfile-only archives.
-- Added age recipient mode (`--age-recipient`) and identity-based decryption (`--age-identity`).
-- Desktop GUI now supports full auth parity (password/keyfile + age), checksum workflows,
-  incremental index selection, and parallel-crypto toggle.
-- Added `noer22_bench` benchmark binary to compare noer22 against optional `7z`/`rar` on the same dataset.
-- Benchmark runner now supports multi-round statistics (`--rounds`, `--warmup-rounds`) and resource sampling (`--sample-ms`) with peak RAM/CPU metrics.
-- Updated `pack` default compression level to `8` (from `6`) based on mixed workload benchmark results.
-- Added strict security hardening:
-  - strict header validation (no implicit KDF fallback),
-  - bounded chunk-length checks,
-  - atomic archive writing and overwrite refusal,
-  - payload pre-authentication before extraction.
-- Added incremental/delta mode (`--incremental-index`) using BLAKE3 fingerprints.
-- Added incremental tombstones for removed files (applied during unpack).
-- Added external checksum generation (`--checksum sha256|blake3`) and verification.
-- Added checksum-only verification flow (`verify --checksum-file ...`) without password.
-- Added full-screen terminal wizard (`ratatui`) for pack/unpack/list/verify flows.
-- Added `--parallel-crypto` experimental deterministic parallel encryption pipeline.
 
-### What Changed
-
-#### Core
-- Extended archive header flags to indicate keyfile-protected, incremental, and age-recipient archives.
-- Updated KDF input model to combine password + keyfile material when both are present.
-- Added age-wrapped file-key envelope for recipient-based archives.
-- Incremental archives now emit deletion tombstones for removed files.
-- Added sidecar checksum module with strict algorithm handling.
-- Added incremental index module (JSON) with parallel file hashing.
-
-#### UX
-- `list` now reports auth mode and archive mode (full/incremental).
-- `unpack` can verify checksum sidecar before extraction.
-
-#### Validation
-- Added integration tests for:
-  - keyfile-only roundtrip and missing-keyfile failure,
-  - age recipient roundtrip using generated identity,
-  - checksum-sidecar verification without password,
-  - incremental archive containing only changed files.
+- Keyfile support (`--keyfile`) for pack/unpack/list/verify.
+- Hybrid auth (`password + keyfile`) and keyfile-only archives.
+- age recipient mode (`--age-recipient`) and identity-based decryption (`--age-identity`).
+- GUI auth parity (password/keyfile + age), checksum workflows, incremental index selection, and parallel-crypto toggle.
+- `noer22_bench` binary with multi-round statistics and resource sampling.
+- Strict hardening:
+  - strict header validation
+  - bounded chunk-length checks
+  - atomic archive writing and overwrite refusal
+  - payload pre-authentication before extraction
+- Incremental/delta mode with BLAKE3 fingerprints.
+- Incremental tombstones for removed files.
+- External checksum generation and verification.
+- Checksum-only verify flow (`verify --checksum-file ...`).
+- Full-screen terminal wizard (`ratatui`) for pack/unpack/list/verify.
 
 ### Commands
+
 ```bash
 noer22 pack <input...> -o backup.noer [-p PASS] [--keyfile FILE] \
   [--age-recipient AGE1...] [--incremental-index index.json] \
@@ -76,16 +58,3 @@ noer22 unpack backup.noer --age-identity identity.txt -C out
 
 noer22 verify backup.noer --checksum-file backup.noer.sha256
 ```
-
-### Validation Executed
-- `cargo fmt`
-- `cargo test`
-- `cargo test --all-features`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo audit`
-
-All checks passed.
-
-### Notes
-- Incremental archives contain changed/new files only.
-- Removed files are emitted as deletion tombstones and applied during unpack.
